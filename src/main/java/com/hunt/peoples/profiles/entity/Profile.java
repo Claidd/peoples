@@ -21,6 +21,9 @@ public class Profile {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    @Column(nullable = false, unique = true)
+    private String externalKey; // например, accountId из otziv
+
     private String name;
 
     /** Путь на сервере, где лежит userDataDir */

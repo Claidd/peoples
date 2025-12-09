@@ -45,12 +45,10 @@ public class ProfileController {
         Profile profile = profileRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Profile not found"));
 
-        String vncUrl = browserContainerService.startBrowser(
-                profile.getId(),
-                profile.getUserDataPath(),
-                profile.getProxyUrl(),
+        String vncUrl = String.valueOf(browserContainerService.startBrowser(
+                profile,
                 appProperties.getHostBaseUrl()
-        );
+        ));
 
         profile.setStatus("BUSY");
         profile.setLastUsedAt(Instant.now());
