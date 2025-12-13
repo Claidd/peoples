@@ -1,0 +1,123 @@
+version: '3.8'
+
+services:
+  # Основное приложение (Spring Boot)
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    image: multibrowser-app:latest
+    container_name: multibrowser-app
+    restart: always
+    environment:
+      - SPRING_PROFILES_ACTIVE=production
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/multibrowser
+      - SPRING_DATASOURCE_USERNAME=postgres
+      - SPRING_DATASOURCE_PASSWORD=${DB_PASSWORD}
+      - SPRING_REDIS_HOST=redis
+      - SPRING_REDIS_PASSWORD=${REDIS_PASSWORD}
+      - APP_HOST_BASE_URL=${HOST_BASE_URL}
+      - APP_BROWSER_IMAGE=multi-browser-chrome-vnc
+      - DOCKER_HOST=tcp://docker-daemon:2375
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./profiles:/app/profiles
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - multibrowser-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Docker daemon для создания контейнеров
+  docker-daemon:
+    image: docker:dind
+    container_name: multibrowser-docker-daemon
+    privileged: true
+    restart: always
+    environment:
+      - DOCKER_TLS_CERTDIR=
+    volumes:
+      - ./docker-data:/var/lib/docker
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - multibrowser-network
+
+  postgres:
+    extends:
+      file: docker-compose.yml
+      service: postgres
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    networks:
+      - multibrowser-network
+
+  redis:
+    extends:
+      file: docker-compose.yml
+      service: redis
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks:
+      - multibrowser-network
+
+  nginx:
+    extends:
+      file: docker-compose.yml
+      service: nginx
+    networks:
+      - multibrowser-network
+
+  # Мониторинг (Prometheus + Grafana)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: multibrowser-prometheus
+    restart: always
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - multibrowser-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: multibrowser-grafana
+    restart: always
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - ./monitoring/grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - multibrowser-network
+
+networks:
+  multibrowser-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

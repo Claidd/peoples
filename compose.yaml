@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:18
+    container_name: multi_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: multibrowser
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+
+  multi-browser-chrome-vnc:
+    image: multi-browser-chrome-vnc:latest  # ← добавляем эту строку
+    build:
+      context: ./browser-image
+      dockerfile: Dockerfile
+    container_name: multi-browser-profile_1
+    environment:
+      - PROXY_URL=
+      - USER_DATA_DIR=/data/user-data
+      - LANGUAGE=en-US
+      - TIMEZONE=Europe/Moscow
+      - SCREEN_WIDTH=1920
+      - SCREEN_HEIGHT=1080
+      - PIXEL_RATIO=1.0
+      - CHROME_FLAGS=--disable-dev-shm-usage --disable-gpu --remote-debugging-port=9222
+    volumes:
+      - ./profiles/profile_1:/data/user-data  # Монтируем всю папку профиля
+    ports:
+      - "6080:6080"  # Используем разные порты для разных профилей
+      - "9222:9222"
+    restart: unless-stopped
+    privileged: true
+    shm_size: 2gb  # Увеличиваем shared memory
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+
+  # Админка для PostgreSQL (опционально)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: multibrowser-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    restart: unless-stopped
+    depends_on:
+      - postgres

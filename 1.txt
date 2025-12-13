@@ -1,0 +1,135 @@
+version: '3.8'
+
+services:
+  # Основное приложение (Java Spring Boot)
+  app:
+    build: .
+    container_name: multibrowser-app
+    depends_on:
+      - postgres
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/multibrowser
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      # Для работы с Docker из контейнера
+      DOCKER_HOST: tcp://host.docker.internal:2375
+      # Базовый URL для доступа к VNC
+      APP_HOST_BASE_URL: http://localhost:8081
+      # Путь для хранения профилей в контейнере
+      APP_BROWSER_BASE_DIR: /app/profiles
+      # Конфигурация fingerprint
+      ANTIDETECT_FINGERPRINT_SPOOF_LEVEL: ENHANCED
+      ANTIDETECT_FINGERPRINT_INJECT_SCRIPTS: "true"
+    ports:
+      - "8081:8081"  # Основное приложение
+    volumes:
+      # Для управления Docker из контейнера
+      # Для Linux/Mac:
+      # - /var/run/docker.sock:/var/run/docker.sock
+      # Для Windows (Docker Desktop):
+      - //var/run/docker.sock:/var/run/docker.sock
+      # Для хранения профилей
+      - ./profiles:/app/profiles
+      # Для кэша Maven/Gradle (если нужно)
+      - ~/.m2:/root/.m2:ro
+    networks:
+      - multibrowser-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    restart: unless-stopped
+
+
+  # База данных PostgreSQL
+  postgres:
+    image: postgres:18
+    container_name: multi_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: multibrowser
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql
+      # Инициализационный скрипт (если нужен)
+#      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - multibrowser-network
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Тестовый браузер-контейнер (пример для тестирования)
+  browser_test:
+    build:
+      context: ./browser-image
+      dockerfile: Dockerfile
+    image: multi-browser-chrome-vnc:latest
+    container_name: browser_profile_test
+    environment:
+      - PROXY_URL=${PROXY_URL:-}
+      - USER_DATA_DIR=/home/chrome/user-data
+      - SCREEN_WIDTH=1920
+      - SCREEN_HEIGHT=1080
+      - USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36
+      - PLATFORM=Win32
+      - TIMEZONE=Europe/Moscow
+      - LANGUAGE=ru-RU
+    volumes:
+      # Используем named volume вместо host mount
+      - browser_test_data:/home/chrome/user-data
+    ports:
+      - "6081:6080"  # VNC доступ
+      - "9223:9222"  # DevTools доступ
+    networks:
+      - multibrowser-network
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    restart: unless-stopped
+    depends_on:
+      - app
+
+  # Админка для PostgreSQL (опционально)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: multibrowser-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    networks:
+      - multibrowser-network
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    restart: unless-stopped
+    depends_on:
+      - postgres
+
+networks:
+  multibrowser-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  postgres_data:
+    driver: local
+  profiles_data:
+    driver: local
+  browser_test_data: # Добавлено для браузера
+    driver: local
+

@@ -2,11 +2,7 @@
 set -e
 
 export DISPLAY=:0
-export XAUTHORITY=/tmp/.Xauthority
-
-rm -f "$XAUTHORITY" 2>/dev/null || true
-touch "$XAUTHORITY"
-chmod 600 "$XAUTHORITY"
+export XAUTHORITY=/root/.Xauthority
 
 # === ПАРАМЕТРЫ ИЗ ПРОФИЛЯ ===
 SCREEN_WIDTH=${SCREEN_WIDTH:-1920}
@@ -29,12 +25,13 @@ export LC_ALL="$LOCALE"
 export LANGUAGE="$LANGUAGE_TAG"
 
 
-# Временная зона (без прав root меняем только TZ)
+# Временная зона
 if [ -n "$TIMEZONE" ]; then
-  echo "Using timezone via TZ env: $TIMEZONE"
-  export TZ="$TIMEZONE"
+    echo "Setting timezone to $TIMEZONE"
+    ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+    echo "$TIMEZONE" > /etc/timezone
+    dpkg-reconfigure --frontend noninteractive tzdata
 fi
-
 
 # === ОЧИСТКА ===
 echo "=== CLEANUP ==="
@@ -307,7 +304,7 @@ CHROME_ARGS="$CHROME_ARGS --disable-component-update"
 CHROME_ARGS="$CHROME_ARGS --disable-background-timer-throttling"
 CHROME_ARGS="$CHROME_ARGS --disable-renderer-backgrounding"
 CHROME_ARGS="$CHROME_ARGS --disable-backgrounding-occluded-windows"
-#CHROME_ARGS="$CHROME_ARGS --disable-web-security"  # Для доступа к file:// URLs
+CHROME_ARGS="$CHROME_ARGS --disable-web-security"  # Для доступа к file:// URLs
 
 # ВАЖНО: НЕ используем эти флаги (они мешают кукам и сессии):
 # --disable-web-security (ОСОБЕННО ВРЕДЕН для куков)
