@@ -1,4 +1,4 @@
-version: '3.8'
+version: "3.8"
 
 services:
   postgres:
@@ -13,37 +13,44 @@ services:
       - "5432:5432"
     volumes:
       - ./postgres_data:/var/lib/postgresql
-    dns:
-      - 1.1.1.1
-      - 8.8.8.8
+    networks:
+      - multi-browser-network
+
 
   multi-browser-chrome-vnc:
-    image: multi-browser-chrome-vnc:latest  # ← добавляем эту строку
-    build:
-      context: ./browser-image
-      dockerfile: Dockerfile
-    container_name: multi-browser-profile_1
-    environment:
-      - PROXY_URL=
-      - USER_DATA_DIR=/data/user-data
-      - LANGUAGE=en-US
-      - TIMEZONE=Europe/Moscow
-      - SCREEN_WIDTH=1920
-      - SCREEN_HEIGHT=1080
-      - PIXEL_RATIO=1.0
-      - CHROME_FLAGS=--disable-dev-shm-usage --disable-gpu --remote-debugging-port=9222
-    volumes:
-      - ./profiles/profile_1:/data/user-data  # Монтируем всю папку профиля
-    ports:
-      - "6080:6080"  # Используем разные порты для разных профилей
-      - "9222:9222"
-    restart: unless-stopped
-    privileged: true
-    shm_size: 2gb  # Увеличиваем shared memory
-    stop_grace_period: 30s
-    stop_signal: SIGTERM
+      image: multi-browser-chrome-vnc:latest
+      build:
+        context: ./browser-image
+        dockerfile: Dockerfile
+      container_name: multi-browser-chrome-vnc
 
-  # Админка для PostgreSQL (опционально)
+#      user: "0:0"
+
+      environment:
+        - USER_DATA_DIR=/data/user-data
+        - LANGUAGE=en-US
+        - TIMEZONE=Europe/Moscow
+        - SCREEN_WIDTH=1920
+        - SCREEN_HEIGHT=1080
+        - SCREEN_COLOR_DEPTH=24
+        - DEVTOOLS_PORT=9222
+        - DEVTOOLS_PROXY_PORT=9223
+        - NOVNC_PORT=6080
+
+      volumes:
+        - ./profiles/profile_1:/data/user-data
+
+      ports:
+        - "6080:6080"
+        - "9222:9222"
+        - "9223:9223"
+
+      shm_size: 2gb
+      restart: unless-stopped
+      stop_grace_period: 90s
+      stop_signal: SIGTERM
+
+
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: multibrowser-pgadmin
@@ -52,9 +59,15 @@ services:
       PGADMIN_DEFAULT_PASSWORD: admin
     ports:
       - "5050:80"
-    dns:
-      - 1.1.1.1
-      - 8.8.8.8
     restart: unless-stopped
     depends_on:
       - postgres
+    networks:
+      - multi-browser-network
+
+networks:
+  multi-browser-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

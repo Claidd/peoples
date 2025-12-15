@@ -321,8 +321,8 @@ public class FingerprintGenerator {
         profile.setScreenPixelDepth(24);
 
         // Устанавливаем временные параметры
-        String[] timezones = {"Europe/Moscow", "America/New_York", "Europe/London", "Asia/Tokyo", "Australia/Sydney"};
-        String[] languages = {"en-US", "ru-RU", "zh-CN", "es-ES", "fr-FR", "de-DE"};
+        String[] timezones = {"Europe/Moscow","Asia/Tokyo"};
+        String[] languages = {"en-US", "ru-RU"};
 
         String timezone = timezones[random.nextInt(timezones.length)];
         String language = languages[random.nextInt(languages.length)];

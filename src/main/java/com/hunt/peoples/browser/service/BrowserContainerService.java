@@ -12,7 +12,7 @@ import com.hunt.peoples.profiles.entity.Profile;
 import com.hunt.peoples.profiles.repository.ProfileRepository;
 import com.hunt.peoples.profiles.service.FingerprintMonitor;
 import jakarta.annotation.PostConstruct;
-import lombok.Builder;
+import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.java_websocket.client.WebSocketClient;
@@ -34,6 +34,8 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 @Service
 @RequiredArgsConstructor
@@ -50,14 +52,14 @@ public class BrowserContainerService {
     // Конфигурация
     private static final String IMAGE_NAME = "multi-browser-chrome-vnc";
     private static final int VNC_CONTAINER_PORT = 6080;
-    private static final int DEVTOOLS_CONTAINER_PORT = 9222;
+    private static final int DEVTOOLS_CONTAINER_PORT = 9223;
 
     // Трекер активных контейнеров
     private static final Map<Long, ContainerInfo> ACTIVE_CONTAINERS = new ConcurrentHashMap<>();
 
     // Трекер запросов к WebSocket
     private final Map<Integer, CompletableFuture<JsonNode>> pendingRequests = new ConcurrentHashMap<>();
-    private int messageIdCounter = 1;
+    private final AtomicInteger messageIdCounter = new AtomicInteger(1);
 
     // Конфигурация из application.yml
     @Value("${browser.container.memory.mb:2048}")
@@ -148,6 +150,10 @@ public class BrowserContainerService {
         Ports portBindings = new Ports();
         portBindings.bind(vncPort, Ports.Binding.bindPort(hostVncPort));
         portBindings.bind(devToolsPort, Ports.Binding.bindPort(hostDevToolsPort));
+        // для впс когда запустим в докере
+//        portBindings.bind(vncPort, Ports.Binding.empty());
+//        portBindings.bind(devToolsPort, Ports.Binding.empty());
+
 
         // Нормализуем путь и создаем директорию
         String hostPath = normalizePath(userDataDir);
@@ -158,10 +164,11 @@ public class BrowserContainerService {
                 .withPortBindings(portBindings)
                 .withBinds(new Bind(hostPath, new Volume("/data/user-data")))
                 .withMemory(containerMemoryMB * 1024 * 1024L)
-                .withMemorySwap((containerMemoryMB * 2) * 1024 * 1024L)
+                .withMemorySwap((containerMemoryMB * 2L) * 1024 * 1024L)
                 .withCpuShares(containerCpuShares)
                 .withPrivileged(false)
-                .withShmSize(shmSizeMB * 1024 * 1024L)
+                .withShmSize(2L * 1024 * 1024 * 1024)
+//                .withShmSize(shmSizeMB * 1024 * 1024L)
                 .withRestartPolicy(RestartPolicy.noRestart())
                 .withCapAdd(Capability.valueOf("SYS_ADMIN"))
                 .withSecurityOpts(Arrays.asList("seccomp=unconfined", "apparmor=unconfined"));
@@ -229,6 +236,9 @@ public class BrowserContainerService {
         // Ждем готовности DevTools
         waitForDevToolsReady(devToolsUrl, Duration.ofSeconds(20));
 
+        // 1) Применяем мобильную эмуляцию (ВАЖНО: до инъекций)
+        applyMobileEmulation(devToolsUrl, profile);
+
         // Внедряем anti-detection скрипты если нужно
         if (injectScripts && shouldInjectScripts(profile)) {
             injectAntiDetectionScripts(devToolsUrl, profile);
@@ -254,6 +264,226 @@ public class BrowserContainerService {
                 .expiresAt(Instant.now().plus(1, ChronoUnit.HOURS))
                 .build();
     }
+
+    private void applyMobileEmulation(String devToolsUrl, Profile profile) {
+        try {
+            String wsUrl = getDevToolsWebSocketUrl(devToolsUrl);
+            if (wsUrl == null) {
+                log.warn("applyMobileEmulation: wsUrl is null, skip");
+                return;
+            }
+
+            boolean mobile = isMobileProfile(profile);
+
+            int width  = safeInt(profile.getScreenWidth(), 390);
+            int height = safeInt(profile.getScreenHeight(), 844);
+
+            // если вдруг в профиле остались 1920x1080 — не считаем это мобилкой
+            if (mobile && width > 700) width = 390;
+            if (mobile && height > 1200) height = 844;
+
+            double dpr = safeDouble(profile.getPixelRatio(), mobile ? 3.0 : 1.0);
+
+            // Включаем базовые домены
+            sendCdpCommand(wsUrl, "Page.enable", Map.of(), 3000);
+            sendCdpCommand(wsUrl, "Network.enable", Map.of(), 3000);
+            sendCdpCommand(wsUrl, "Runtime.enable", Map.of(), 3000);
+
+            // 1) Device metrics: ВОТ ЭТО делает "mobile=true"
+            Map<String, Object> metrics = new HashMap<>();
+            metrics.put("width", width);
+            metrics.put("height", height);
+            metrics.put("deviceScaleFactor", dpr);
+            metrics.put("mobile", mobile);
+            metrics.put("screenWidth", width);
+            metrics.put("screenHeight", height);
+
+            // ориентация (необязательно, но полезно)
+            Map<String, Object> orientation = new HashMap<>();
+            orientation.put("type", "portraitPrimary");
+            orientation.put("angle", 0);
+            metrics.put("screenOrientation", orientation);
+
+            sendCdpCommand(wsUrl, "Emulation.setDeviceMetricsOverride", metrics, 5000);
+
+            // 2) Touch
+            sendCdpCommand(wsUrl, "Emulation.setTouchEmulationEnabled",
+                    Map.of("enabled", mobile, "maxTouchPoints", mobile ? safeInt(profile.getMaxTouchPoints(), 5) : 0),
+                    3000
+            );
+
+            // 3) UA + UA-CH (userAgentMetadata)
+            String ua = profile.getUserAgent() != null ? profile.getUserAgent().trim() : "";
+            if (!ua.isEmpty()) {
+                Map<String, Object> uaParams = new HashMap<>();
+                uaParams.put("userAgent", ua);
+                uaParams.put("acceptLanguage", profile.getLanguage() != null ? profile.getLanguage() : "en-US");
+
+                // Минимальная UA-CH мета (чтобы сайты не палили "desktop hints")
+                Map<String, Object> uaMeta = new HashMap<>();
+                uaMeta.put("mobile", mobile);
+
+                // Платформа: лучше “Android” для мобилки
+                String platform = detectPlatformForUaCh(profile, ua, mobile);
+                uaMeta.put("platform", platform);
+
+                // Архитектуру можно опустить
+                // uaMeta.put("architecture", "arm");
+
+                uaParams.put("userAgentMetadata", uaMeta);
+
+                sendCdpCommand(wsUrl, "Network.setUserAgentOverride", uaParams, 5000);
+            }
+
+            // 4) Локаль и таймзона (чтобы не было “телефон в РФ, а TZ в США”)
+            if (profile.getLocale() != null && !profile.getLocale().isBlank()) {
+                sendCdpCommand(wsUrl, "Emulation.setLocaleOverride",
+                        Map.of("locale", profile.getLocale()),
+                        3000);
+            }
+            if (profile.getTimezone() != null && !profile.getTimezone().isBlank()) {
+                sendCdpCommand(wsUrl, "Emulation.setTimezoneOverride",
+                        Map.of("timezoneId", profile.getTimezone()),
+                        3000);
+            }
+
+            // 5) Перезагрузка, чтобы сайт пересчитал верстку по новым условиям
+            sendCdpCommand(wsUrl, "Page.reload", Map.of("ignoreCache", true), 10000);
+
+            log.info("Mobile emulation applied: mobile={}, {}x{}, dpr={}", mobile, width, height, dpr);
+        } catch (Exception e) {
+            log.warn("applyMobileEmulation failed for profile {}: {}", profile.getId(), e.getMessage(), e);
+        }
+    }
+
+    private JsonNode sendCdpCommand(String wsUrl, String method, Map<String, Object> params, long timeoutMs) {
+        CompletableFuture<JsonNode> resultFuture = new CompletableFuture<>();
+
+        try {
+            URI uri = new URI(wsUrl);
+
+            WebSocketClient wsClient = new WebSocketClient(uri) {
+                private int id;
+
+                @Override
+                public void onOpen(ServerHandshake handshake) {
+                    try {
+                        synchronized (BrowserContainerService.this) {
+                            id = messageIdCounter.getAndIncrement();
+                        }
+
+                        Map<String, Object> msg = new HashMap<>();
+                        msg.put("id", id);
+                        msg.put("method", method);
+                        if (params != null && !params.isEmpty()) {
+                            msg.put("params", params);
+                        }
+
+                        String json = objectMapper.writeValueAsString(msg);
+
+                        CompletableFuture<JsonNode> pending = new CompletableFuture<>();
+                        pendingRequests.put(id, pending);
+
+                        send(json);
+
+                        executorService.submit(() -> {
+                            try {
+                                JsonNode resp = pending.get(timeoutMs, TimeUnit.MILLISECONDS);
+                                resultFuture.complete(resp);
+                            } catch (TimeoutException te) {
+                                resultFuture.completeExceptionally(te);
+                            } catch (Exception e) {
+                                resultFuture.completeExceptionally(e);
+                            } finally {
+                                pendingRequests.remove(id);
+                                try { close(); } catch (Exception ignore) {}
+                            }
+                        });
+
+                    } catch (Exception e) {
+                        resultFuture.completeExceptionally(e);
+                        try { close(); } catch (Exception ignore) {}
+                    }
+                }
+
+                @Override
+                public void onMessage(String message) {
+                    try {
+                        JsonNode node = objectMapper.readTree(message);
+                        if (node.has("id")) {
+                            int respId = node.get("id").asInt();
+                            CompletableFuture<JsonNode> pending = pendingRequests.remove(respId);
+                            if (pending != null) {
+                                if (node.has("error")) pending.complete(node);
+                                else pending.complete(node);
+                            }
+                        }
+                    } catch (Exception e) {
+                        // не валим все, просто лог
+                        log.trace("CDP parse error: {}", e.getMessage());
+                    }
+                }
+
+                @Override
+                public void onClose(int code, String reason, boolean remote) {
+                    if (!resultFuture.isDone()) {
+                        resultFuture.completeExceptionally(new RuntimeException("CDP ws closed: " + reason));
+                    }
+                }
+
+                @Override
+                public void onError(Exception ex) {
+                    if (!resultFuture.isDone()) resultFuture.completeExceptionally(ex);
+                }
+            };
+
+            wsClient.setConnectionLostTimeout(10);
+
+            boolean connected = wsClient.connectBlocking(websocketConnectTimeout, TimeUnit.MILLISECONDS);
+            if (!connected) throw new TimeoutException("CDP connect timeout");
+
+            return resultFuture.get(timeoutMs + 2000, TimeUnit.MILLISECONDS);
+
+        } catch (Exception e) {
+            throw new RuntimeException("CDP command failed: " + method + " -> " + e.getMessage(), e);
+        }
+    }
+
+
+    private boolean isMobileProfile(Profile profile) {
+        // 1) если у тебя есть отдельный флаг — используй его.
+        // 2) иначе эвристика по UA/платформе/размеру
+        String ua = profile.getUserAgent() != null ? profile.getUserAgent() : "";
+        String platform = profile.getPlatform() != null ? profile.getPlatform() : "";
+        Integer w = profile.getScreenWidth();
+
+        if (ua.contains("Android") || ua.contains("iPhone") || ua.contains("Mobile")) return true;
+        if (platform.toLowerCase().contains("android") || platform.toLowerCase().contains("iphone")) return true;
+        if (w != null && w <= 500) return true;
+
+        return false;
+    }
+
+    private String detectPlatformForUaCh(Profile profile, String ua, boolean mobile) {
+        String p = profile.getPlatform() != null ? profile.getPlatform().toLowerCase() : "";
+        if (p.contains("android") || ua.contains("Android")) return "Android";
+        if (p.contains("iphone") || ua.contains("iPhone")) return "iOS";
+        return mobile ? "Android" : "Windows";
+    }
+
+    private int safeInt(Integer val, int def) {
+        return (val == null || val <= 0) ? def : val;
+    }
+
+    private double safeDouble(Double val, double def) {
+        return (val == null || val <= 0) ? def : val;
+    }
+
+
+
+
+
+
 
     /**
      * Подготавливает environment variables для контейнера
@@ -470,7 +700,7 @@ public class BrowserContainerService {
         List<String> flags = new ArrayList<>();
 
         // === БАЗОВЫЕ ФЛАГИ БЕЗОПАСНОСТИ ===
-        flags.add("--no-sandbox");
+//        flags.add("--no-sandbox");
         flags.add("--disable-dev-shm-usage");
         flags.add("--disable-gpu");
         flags.add("--disable-software-rasterizer");
@@ -695,7 +925,7 @@ public class BrowserContainerService {
 
                     // Генерируем ID сообщения
                     synchronized (BrowserContainerService.this) {
-                        currentMessageId = messageIdCounter++;
+                        currentMessageId = messageIdCounter.getAndIncrement();
                     }
 
                     // Создаем сообщение для выполнения скрипта
@@ -1073,7 +1303,7 @@ public class BrowserContainerService {
                 @Override
                 public void onOpen(ServerHandshake handshake) {
                     synchronized (BrowserContainerService.this) {
-                        currentMessageId = messageIdCounter++;
+                        currentMessageId = messageIdCounter.getAndIncrement();
                     }
 
                     Map<String, Object> message = new HashMap<>();
@@ -1170,51 +1400,175 @@ public class BrowserContainerService {
         return resultFuture;
     }
 
-    /**
-     * Останавливает браузер для профиля
-     */
+    private final ConcurrentHashMap<Long, ReentrantLock> STOP_LOCKS = new ConcurrentHashMap<>();
+
     public void stopBrowser(Long profileId) {
-        String containerName = "browser_profile_" + profileId;
-        log.info("Stopping browser container {}", containerName);
+        final String containerName = "browser_profile_" + profileId;
 
-        // Удаляем из активных контейнеров
-        ContainerInfo containerInfo = ACTIVE_CONTAINERS.remove(profileId);
-
-        if (containerInfo != null) {
-            Duration runtime = Duration.between(containerInfo.getStartedAt(), Instant.now());
-            log.info("Container {} ran for {} minutes", containerName, runtime.toMinutes());
-        }
-
+        ReentrantLock lock = STOP_LOCKS.computeIfAbsent(profileId, id -> new ReentrantLock());
+        lock.lock();
         try {
-            // Останавливаем контейнер
-            dockerClient.stopContainerCmd(containerName)
-                    .withTimeout(10)
-                    .exec();
-            log.debug("Container {} stopped", containerName);
+            log.info("Stopping browser container {}", containerName);
 
-        } catch (com.github.dockerjava.api.exception.NotFoundException e) {
-            log.debug("Container {} not found when stopping", containerName);
-        } catch (Exception e) {
-            log.warn("Error stopping container {}: {}", containerName, e.getMessage());
+            // 1) Если контейнера нет — просто приводим профиль в FREE и чистим ACTIVE
+            var inspected = inspectQuiet(containerName);
+            if (inspected == null) {
+                log.info("Container {} not found (already removed).", containerName);
+                ACTIVE_CONTAINERS.remove(profileId);
+                updateProfileStatus(profileId, "FREE");
+                return;
+            }
+
+            // 2) Логируем runtime (но НЕ удаляем из ACTIVE пока не завершили stop/remove)
+            ContainerInfo info = ACTIVE_CONTAINERS.get(profileId);
+            if (info != null) {
+                Duration runtime = Duration.between(info.getStartedAt(), Instant.now());
+                log.info("Container {} ran for {} minutes", containerName, runtime.toMinutes());
+            } else {
+                log.info("Profile {} is not in ACTIVE_CONTAINERS (stop is still idempotent)", profileId);
+            }
+
+            // 3) Посылаем stop (дай нормальный timeout, 60–90с)
+            try {
+                dockerClient.stopContainerCmd(containerName)
+                        .withTimeout(90)
+                        .exec();
+                log.debug("Stop command sent to {}", containerName);
+            } catch (com.github.dockerjava.api.exception.NotFoundException e) {
+                log.info("Container {} disappeared during stop", containerName);
+                ACTIVE_CONTAINERS.remove(profileId);
+                updateProfileStatus(profileId, "FREE");
+                return;
+            } catch (Exception e) {
+                log.warn("Error stopping container {}: {}", containerName, e.getMessage());
+                // не выходим — попробуем дождаться, возможно он уже остановился
+            }
+
+            // 4) Ждём, пока реально stopped
+            boolean stopped = waitStopped(containerName, 120);
+            if (!stopped) {
+                // Критично: лучше НЕ удалять контейнер, чем ломать профиль
+                log.warn("Container {} did not stop within timeout; skipping remove to avoid profile corruption", containerName);
+                // контейнер может быть ещё жив — ACTIVE не трогаем
+                updateProfileStatus(profileId, "FREE");
+                return;
+            }
+
+            // 5) Удаляем контейнер без force (force = частый источник порчи профиля)
+            try {
+                dockerClient.removeContainerCmd(containerName)
+                        .withForce(false)
+                        .withRemoveVolumes(false)
+                        .exec();
+                log.debug("Container {} removed", containerName);
+            } catch (com.github.dockerjava.api.exception.NotFoundException e) {
+                log.debug("Container {} not found when removing (already removed)", containerName);
+            } catch (Exception e) {
+                log.warn("Error removing container {}: {}", containerName, e.getMessage());
+            }
+
+            // 6) Теперь можно убрать из ACTIVE
+            ACTIVE_CONTAINERS.remove(profileId);
+
+            updateProfileStatus(profileId, "FREE");
+
+        } finally {
+            lock.unlock();
+            // STOP_LOCKS.remove(profileId, lock); // можно оставить как есть
         }
-
-        try {
-            // Удаляем контейнер
-            dockerClient.removeContainerCmd(containerName)
-                    .withForce(true)
-                    .withRemoveVolumes(false) // Не удаляем volume с user data
-                    .exec();
-            log.debug("Container {} removed", containerName);
-
-        } catch (com.github.dockerjava.api.exception.NotFoundException e) {
-            log.debug("Container {} not found when removing", containerName);
-        } catch (Exception e) {
-            log.warn("Error removing container {}: {}", containerName, e.getMessage());
-        }
-
-        // Обновляем статус профиля
-        updateProfileStatus(profileId, "FREE");
     }
+
+    private boolean waitStopped(String name, int seconds) {
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(seconds);
+
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                var c = dockerClient.inspectContainerCmd(name).exec();
+                Boolean running = (c.getState() != null) ? c.getState().getRunning() : null;
+                if (running == null || !running) return true;
+            } catch (com.github.dockerjava.api.exception.NotFoundException e) {
+                return true; // исчез = значит остановлен/удалён
+            } catch (Exception e) {
+                log.debug("waitStopped inspect error for {}: {}", name, e.getMessage());
+            }
+
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private Object inspectQuiet(String name) {
+        try {
+            return dockerClient.inspectContainerCmd(name).exec();
+        } catch (com.github.dockerjava.api.exception.NotFoundException e) {
+            return null;
+        } catch (Exception e) {
+            log.warn("inspectQuiet error for {}: {}", name, e.getMessage());
+            return null;
+        }
+    }
+
+//    public void stopBrowser(Long profileId) {
+//        String containerName = "browser_profile_" + profileId;
+//        log.info("Stopping browser container {}", containerName);
+//
+//        // Удаляем из активных контейнеров
+//        ContainerInfo containerInfo = ACTIVE_CONTAINERS.remove(profileId);
+//
+//        if (containerInfo != null) {
+//            Duration runtime = Duration.between(containerInfo.getStartedAt(), Instant.now());
+//            log.info("Container {} ran for {} minutes", containerName, runtime.toMinutes());
+//        }
+//
+//        try {
+//            // Останавливаем контейнер
+//            dockerClient.stopContainerCmd(containerName).withTimeout(20).exec();
+//                waitStopped(containerName, 30);
+//                dockerClient.removeContainerCmd(containerName).withForce(false).withRemoveVolumes(false).exec();
+//            log.debug("Container {} stopped", containerName);
+//
+//        } catch (com.github.dockerjava.api.exception.NotFoundException e) {
+//            log.debug("Container {} not found when stopping", containerName);
+//        } catch (Exception e) {
+//            log.warn("Error stopping container {}: {}", containerName, e.getMessage());
+//        }
+//
+//        try {
+//            // Удаляем контейнер
+//            dockerClient.removeContainerCmd(containerName)
+//                    .withForce(false)
+//                    .withRemoveVolumes(false) // Не удаляем volume с user data
+//                    .exec();
+//            log.debug("Container {} removed", containerName);
+//
+//        } catch (com.github.dockerjava.api.exception.NotFoundException e) {
+//            log.debug("Container {} not found when removing", containerName);
+//        } catch (Exception e) {
+//            log.warn("Error removing container {}: {}", containerName, e.getMessage());
+//        }
+//
+//        // Обновляем статус профиля
+//        updateProfileStatus(profileId, "FREE");
+//    }
+//
+//    private void waitStopped(String name, int seconds) {
+//        long deadline = System.currentTimeMillis() + seconds * 1000L;
+//        while (System.currentTimeMillis() < deadline) {
+//            try {
+//                var c = dockerClient.inspectContainerCmd(name).exec();
+//                Boolean running = c.getState() != null ? c.getState().getRunning() : null;
+//                if (running == null || !running) return;
+//            } catch (com.github.dockerjava.api.exception.NotFoundException e) {
+//                return; // уже исчез
+//            }
+//            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+//        }
+//    }
 
     /**
      * Останавливает все активные контейнеры
@@ -1623,6 +1977,12 @@ public class BrowserContainerService {
             log.error("Failed to cleanup inactive containers: {}", e.getMessage(), e);
         }
     }
+
+    @PreDestroy
+    public void shutdown() {
+        executorService.shutdownNow();
+    }
+
 
     // ================== DTO И ВСПОМОГАТЕЛЬНЫЕ КЛАССЫ ==================
 

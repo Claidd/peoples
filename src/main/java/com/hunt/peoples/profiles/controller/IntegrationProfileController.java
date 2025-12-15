@@ -15,6 +15,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.util.UriComponentsBuilder;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -123,6 +124,28 @@ public class IntegrationProfileController {
         }
     }
 
+    private String tuneNoVncUrl(String rawUrl) {
+        if (rawUrl == null || rawUrl.isBlank()) return rawUrl;
+
+        // Важно: не затираем существующие параметры, только добавляем/переписываем нужные
+        UriComponentsBuilder b = UriComponentsBuilder.fromUriString(rawUrl);
+
+        b.replaceQueryParam("autoconnect", "1");
+        b.replaceQueryParam("reconnect", "1");
+
+        // ключевые для твоей проблемы:
+        // - resize=none => noVNC не пытается “fit/scale” в iframe
+        // - clip=true  => появятся скроллы (и горизонтальный тоже), можно “панорамировать”
+        b.replaceQueryParam("resize", "none");
+        b.replaceQueryParam("clip", "true");
+
+        // опционально:
+        // b.replaceQueryParam("show_dot_cursor", "1");
+        // b.replaceQueryParam("view_only", "0");
+
+        return b.build(true).toUriString();
+    }
+
     @GetMapping("/{externalKey}/status")
     @Operation(summary = "Получить статус профиля по externalKey")
     public ResponseEntity<IntegrationStatusResponse> getStatus(@PathVariable String externalKey) {
@@ -224,7 +247,7 @@ public class IntegrationProfileController {
                     .profileId(profile.getId())
                     .success(true)
                     .alreadyRunning(true)
-                    .vncUrl(vncUrl)
+                    .vncUrl(tuneNoVncUrl(vncUrl))
                     .userAgent(profile.getUserAgent())
                     .screenResolution(getScreenResolution(profile))
                     .platform(profile.getPlatform())
@@ -253,7 +276,7 @@ public class IntegrationProfileController {
                 .profileId(profile.getId())
                 .success(true)
                 .alreadyRunning(false)
-                .vncUrl(result.vncUrl())
+                .vncUrl(tuneNoVncUrl(result.vncUrl()))
                 .userAgent(profile.getUserAgent())
                 .screenResolution(getScreenResolution(profile))
                 .platform(profile.getPlatform())
@@ -330,6 +353,7 @@ public class IntegrationProfileController {
             String detectionLevel,
             Boolean forceNewFingerprint
     ) {}
+
 
     @Data
     @Builder
