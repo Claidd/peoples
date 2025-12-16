@@ -11,27 +11,15 @@ import java.time.Instant;
 
 @Data
 @Builder
-@NoArgsConstructor
-@AllArgsConstructor
 public class ContainerInfo {
     private String containerId;
     private String containerName;
     private Long profileId;
-    private Integer hostVncPort;
-    private Integer hostDevToolsPort;
+    private int hostVncPort;
+    private int hostDevToolsPort;
     private Instant startedAt;
-    private Instant stoppedAt;
 
     public Duration getUptime() {
-        if (startedAt == null) return Duration.ZERO;
-        Instant end = stoppedAt != null ? stoppedAt : Instant.now();
-        return Duration.between(startedAt, end);
+        return startedAt == null ? Duration.ZERO : Duration.between(startedAt, Instant.now());
     }
-
-    public boolean isRunning() {
-        return stoppedAt == null;
-    }
-
-    // Метод getVncUrl может потребовать дополнительной логики,
-    // если он зависит от BrowserContainerService
 }

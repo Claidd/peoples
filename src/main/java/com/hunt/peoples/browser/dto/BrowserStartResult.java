@@ -6,13 +6,10 @@ import java.time.Instant;
 @Builder
 public record BrowserStartResult(
         Long profileId,
-        String vncUrl,       // поле должно называться vncUrl
-        String externalKey,
+        String vncUrl,
         String devToolsUrl,
-        Instant expiresAt,
+        String externalKey,
+        String containerId,
         Instant startedAt,
-        String containerId
-) {
-    // Метод доступа уже есть автоматически в record
-    // public String vncUrl() { return this.vncUrl; }
-}
+        Instant expiresAt
+) {}

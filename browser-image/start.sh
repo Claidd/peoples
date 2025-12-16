@@ -14,17 +14,16 @@ SCREEN_HEIGHT="${SCREEN_HEIGHT:-1080}"
 SCREEN_DEPTH="${SCREEN_COLOR_DEPTH:-24}"
 SCREEN_GEOMETRY="${SCREEN_WIDTH}x${SCREEN_HEIGHT}x${SCREEN_DEPTH}"
 
-# ВАЖНО: DPR/PIXEL_RATIO здесь НЕ используем в флагах Chromium.
-# Пусть DPR применяет ТОЛЬКО твой DevTools (Emulation.setDeviceMetricsOverride).
+# DPR НЕ задаём флагами Chromium — пусть делает только DevTools эмуляция у тебя в Java
 PIXEL_RATIO="${PIXEL_RATIO:-1.0}"
 
 USER_DATA_DIR="${USER_DATA_DIR:-/data/user-data}"
 LANGUAGE_SAFE="${LANGUAGE:-en-US}"
 TZ_SAFE="${TIMEZONE:-${TZ:-}}"
 
-DEVTOOLS_PORT="${DEVTOOLS_PORT:-9222}"
-DEVTOOLS_PROXY_PORT="${DEVTOOLS_PROXY_PORT:-9223}"
+DEVTOOLS_PORT="${DEVTOOLS_PORT:-9223}"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
+
 
 CHROMIUM_BIN="${CHROMIUM_BIN:-$(command -v chromium || true)}"
 if [[ -z "${CHROMIUM_BIN}" ]]; then
@@ -33,30 +32,82 @@ if [[ -z "${CHROMIUM_BIN}" ]]; then
 fi
 
 CHROME_PID=""
+CHROME_PGID=""
 XVFB_PID=""
+SYNC_PID=""
+
+# =============================
+# helpers
+# =============================
+get_pgid() {
+  local pid="$1"
+  ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ' || true
+}
+
+start_sync_loop() {
+  # Периодически флашим файловую систему (актуально для bind mount на Windows)
+  (
+    while true; do
+      [[ -n "${CHROME_PID}" ]] && kill -0 "${CHROME_PID}" 2>/dev/null || exit 0
+      sync || true
+      sleep 5
+    done
+  ) &
+  SYNC_PID=$!
+}
+
+stop_process_group_gracefully() {
+  local pgid="$1"
+  local title="$2"
+
+  [[ -z "${pgid}" ]] && return 0
+
+  log "Stopping ${title} process group PGID=${pgid} (TERM, wait up to 45s)..."
+  kill -TERM "-${pgid}" 2>/dev/null || true
+
+  for _ in $(seq 1 45); do
+    # если в группе процессов уже никого нет — выходим
+    if ! ps -o pid= --pgid "${pgid}" 2>/dev/null | grep -q '[0-9]'; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  log "${title} still running -> INT (wait 10s)..."
+  kill -INT "-${pgid}" 2>/dev/null || true
+  sleep 10
+
+  if ps -o pid= --pgid "${pgid}" 2>/dev/null | grep -q '[0-9]'; then
+    log "${title} still running -> KILL"
+    kill -KILL "-${pgid}" 2>/dev/null || true
+  fi
+}
 
 cleanup() {
   log "=== SHUTDOWN ==="
 
+  # останавливаем sync loop
+  if [[ -n "${SYNC_PID}" ]] && kill -0 "${SYNC_PID}" 2>/dev/null; then
+    kill -TERM "${SYNC_PID}" 2>/dev/null || true
+  fi
+
+  # дать шанс дописать профиль
   if [[ -n "${CHROME_PID}" ]] && kill -0 "${CHROME_PID}" 2>/dev/null; then
     log "Pre-shutdown wait (flush profile to disk)..."
-    sleep 6
+    sync || true
+    sleep 8
+  fi
 
-    log "Stopping Chromium (TERM, wait up to 30s)..."
+  # останавливаем chromium как process-group
+  if [[ -n "${CHROME_PGID}" ]]; then
+    stop_process_group_gracefully "${CHROME_PGID}" "Chromium"
+  elif [[ -n "${CHROME_PID}" ]] && kill -0 "${CHROME_PID}" 2>/dev/null; then
+    log "Stopping Chromium by PID (fallback)..."
     kill -TERM "${CHROME_PID}" 2>/dev/null || true
-    for _ in $(seq 1 30); do
-      kill -0 "${CHROME_PID}" 2>/dev/null || break
-      sleep 1
-    done
-
-    if kill -0 "${CHROME_PID}" 2>/dev/null; then
-      log "Chromium still running -> KILL"
-      kill -KILL "${CHROME_PID}" 2>/dev/null || true
-    fi
   fi
 
   sync || true
-  sleep 1
+  sleep 2
 
   pkill -TERM -f "socat TCP-LISTEN:${DEVTOOLS_PROXY_PORT}" 2>/dev/null || true
   pkill -TERM -f "novnc_proxy|websockify" 2>/dev/null || true
@@ -112,6 +163,7 @@ rm -f "/tmp/.X11-unix/X${DISPLAY_NUM}" 2>/dev/null || true
 # ensure profile writable
 # =============================
 mkdir -p "${USER_DATA_DIR}/Default" || true
+
 TEST_FILE="${USER_DATA_DIR}/__write_test"
 echo "ok" > "${TEST_FILE}" 2>/dev/null || {
   log "FATAL: USER_DATA_DIR is not writable: ${USER_DATA_DIR}"
@@ -120,8 +172,11 @@ echo "ok" > "${TEST_FILE}" 2>/dev/null || {
 }
 rm -f "${TEST_FILE}" 2>/dev/null || true
 
-# remove only singleton locks
+# удаляем только локи
 find "${USER_DATA_DIR}" -maxdepth 2 -name "Singleton*" -delete 2>/dev/null || true
+
+log "Profile dir: ${USER_DATA_DIR}"
+ls -la "${USER_DATA_DIR}" 2>/dev/null || true
 
 # =============================
 # Xvfb
@@ -151,7 +206,6 @@ done
 log "Starting fluxbox..."
 fluxbox >/tmp/fluxbox.log 2>&1 &
 
-# ждём WM
 if command -v wmctrl >/dev/null 2>&1; then
   for _ in $(seq 1 40); do
     wmctrl -m >/dev/null 2>&1 && break
@@ -175,6 +229,7 @@ rm -f "${CHROME_LOG}" 2>/dev/null || true
 
 CHROME_ARGS=(
   "--user-data-dir=${USER_DATA_DIR}"
+  "--profile-directory=Default"
   "--window-size=${SCREEN_WIDTH},${SCREEN_HEIGHT}"
   "--window-position=0,0"
   "--lang=${LANGUAGE_SAFE}"
@@ -182,17 +237,24 @@ CHROME_ARGS=(
   "--no-first-run"
   "--no-default-browser-check"
   "--disable-dev-shm-usage"
-  "--remote-debugging-address=127.0.0.1"
+  "--disable-session-crashed-bubble"
+
+  "--remote-debugging-address=0.0.0.0"
   "--remote-debugging-port=${DEVTOOLS_PORT}"
   "--remote-allow-origins=*"
+
   "--password-store=basic"
+  "--use-mock-keychain"
   "--no-sandbox"
 )
 
-log "Starting Chromium: ${CHROMIUM_BIN}"
-"${CHROMIUM_BIN}" "${CHROME_ARGS[@]}" >"${CHROME_LOG}" 2>&1 &
+log "Starting Chromium (new process group via setsid): ${CHROMIUM_BIN}"
+setsid "${CHROMIUM_BIN}" "${CHROME_ARGS[@]}" >"${CHROME_LOG}" 2>&1 &
 CHROME_PID=$!
-log "Chromium PID: ${CHROME_PID}"
+sleep 0.5
+CHROME_PGID="$(get_pgid "${CHROME_PID}")"
+
+log "Chromium PID: ${CHROME_PID}, PGID: ${CHROME_PGID}"
 
 sleep 2
 if ! kill -0 "${CHROME_PID}" 2>/dev/null; then
@@ -200,6 +262,8 @@ if ! kill -0 "${CHROME_PID}" 2>/dev/null; then
   tail -n 200 "${CHROME_LOG}" || true
   exit 1
 fi
+
+start_sync_loop
 
 # =============================
 # DevTools wait
@@ -213,11 +277,11 @@ for i in $(seq 1 60); do
   sleep 1
 done
 
-log "Starting DevTools proxy :${DEVTOOLS_PROXY_PORT} -> :${DEVTOOLS_PORT}"
-socat "TCP-LISTEN:${DEVTOOLS_PROXY_PORT},fork,reuseaddr" "TCP:127.0.0.1:${DEVTOOLS_PORT}" >/tmp/socat.log 2>&1 &
+#log "Starting DevTools proxy :${DEVTOOLS_PROXY_PORT} -> :${DEVTOOLS_PORT}"
+#socat "TCP-LISTEN:${DEVTOOLS_PROXY_PORT},fork,reuseaddr" "TCP:127.0.0.1:${DEVTOOLS_PORT}" >/tmp/socat.log 2>&1 &
 
 # =============================
-# FIX geometry: лёгкий resize + reset zoom (без DPI-магии)
+# FIX geometry
 # =============================
 if command -v xdotool >/dev/null 2>&1; then
   log "Fixing Chromium window geometry + reset zoom..."
@@ -243,15 +307,21 @@ fi
 log "=== STARTUP COMPLETE ==="
 log "noVNC:    http://localhost:${NOVNC_PORT}/vnc.html"
 log "DevTools: http://localhost:${DEVTOOLS_PORT}"
-log "Proxy:    http://localhost:${DEVTOOLS_PROXY_PORT}"
+#log "Proxy:    http://localhost:${DEVTOOLS_PROXY_PORT}"
 log "Profile:  ${USER_DATA_DIR}"
 log "Xvfb:     ${SCREEN_GEOMETRY}"
 log "Note:     DPR is handled by DevTools emulation (PIXEL_RATIO=${PIXEL_RATIO})"
 
 wait "${CHROME_PID}" || true
+
+# финальный flush после выхода chromium
+sync || true
+sleep 2
+
 log "Chromium exited. Tail log:"
 tail -n 200 "${CHROME_LOG}" || true
 exit 0
+
 
 
 

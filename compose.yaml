@@ -24,7 +24,7 @@ services:
         dockerfile: Dockerfile
       container_name: multi-browser-chrome-vnc
 
-#      user: "0:0"
+      user: "0:0"
 
       environment:
         - USER_DATA_DIR=/data/user-data

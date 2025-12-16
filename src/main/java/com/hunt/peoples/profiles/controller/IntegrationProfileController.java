@@ -98,19 +98,30 @@ public class IntegrationProfileController {
         try {
             return profileRepository.findByExternalKey(externalKey)
                     .map(profile -> {
-                        // Останавливаем браузер
-                        browserContainerService.stopBrowser(profile.getId());
+                        boolean stopped = browserContainerService.stopBrowser(profile.getId());
 
-                        // Обновляем статус профиля
-                        profile.setStatus("FREE");
-                        profile.setLockedByUserId(null);
-                        profile.setLastUsedAt(Instant.now());
-                        profileRepository.save(profile);
+                        if (stopped) {
+                            // теперь можно safely ставить FREE
+                            profile.setStatus("FREE");
+                            profile.setLockedByUserId(null);
+                            profile.setLastUsedAt(Instant.now());
+                            profileRepository.save(profile);
 
-                        log.info("Browser stopped for profile {} (externalKey: {})",
-                                profile.getId(), externalKey);
+                            log.info("Browser stopped for profile {} (externalKey: {})",
+                                    profile.getId(), externalKey);
 
-                        return ResponseEntity.ok(IntegrationStopResponse.success(externalKey));
+                            return ResponseEntity.ok(IntegrationStopResponse.success(externalKey));
+                        } else {
+                            // контейнер ещё “дожимается” или завис — не освобождаем профиль
+                            profile.setStatus("STOPPING"); // или BUSY, но лучше STOPPING
+                            profile.setLastUsedAt(Instant.now());
+                            profileRepository.save(profile);
+
+                            return ResponseEntity
+                                    .status(HttpStatus.ACCEPTED)
+                                    .body(IntegrationStopResponse.error(externalKey,
+                                            "Stop in progress; container not stopped yet"));
+                        }
                     })
                     .orElseGet(() -> {
                         log.warn("Profile not found for externalKey: {}", externalKey);
@@ -123,6 +134,7 @@ public class IntegrationProfileController {
                     .body(IntegrationStopResponse.error(externalKey, e.getMessage()));
         }
     }
+
 
     private String tuneNoVncUrl(String rawUrl) {
         if (rawUrl == null || rawUrl.isBlank()) return rawUrl;

@@ -31,7 +31,7 @@ COPY start.sh /scripts/start.sh
 RUN chmod +x /scripts/start.sh
 
 WORKDIR /scripts
-EXPOSE 6080 9222 9223
+EXPOSE 6080 9223
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -fsS http://127.0.0.1:6080/ >/dev/null || exit 1
