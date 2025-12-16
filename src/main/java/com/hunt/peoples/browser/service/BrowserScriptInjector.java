@@ -3,9 +3,14 @@ package com.hunt.peoples.browser.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hunt.peoples.browser.config.DevToolsClient;
+import com.hunt.peoples.browser.config.DevToolsSession;
 import com.hunt.peoples.profiles.entity.Profile;
+import com.hunt.peoples.profiles.repository.ProfileRepository;
+import com.hunt.peoples.profiles.service.QaScriptGenerator;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -19,6 +24,22 @@ import java.util.Map;
 public class BrowserScriptInjector {
 
     private final ObjectMapper objectMapper;
+    private final ProfileRepository profileRepository;
+    private final DevToolsClient devToolsClient;
+    private final QaScriptGenerator qaScriptGenerator;
+    @Value("${browser.cdp.inject.enabled:true}")
+    private boolean injectEnabled;
+
+
+    @Value("${browser.cdp.inject.cmd-timeout-ms:3000}")
+    private long cmdTimeoutMs;
+
+    // чтобы не улететь в огромные payload’ы (можно подкрутить)
+    @Value("${browser.cdp.inject.max-script-bytes:250000}") // ~250KB на 1 скрипт
+    private int maxScriptBytes;
+
+    @Value("${browser.cdp.inject.max-total-bytes:1500000}") // ~1.5MB суммарно
+    private long maxTotalBytes;
 
     /**
      * Генерирует полный инъекционный скрипт для профиля
@@ -1118,6 +1139,8 @@ public class BrowserScriptInjector {
         }
     }
 
+
+
     /**
      * Генерирует скрипт для защиты от WebRTC fingerprinting
      */
@@ -1169,6 +1192,62 @@ public class BrowserScriptInjector {
                 console.debug('[Anti-Detect] WebRTC protection applied');
             })();
             """;
+    }
+
+    public String generateConsistencyScript(Profile profile) {
+        boolean ios = false;
+        String ua = profile.getUserAgent() != null ? profile.getUserAgent() : "";
+        String platform = profile.getPlatform() != null ? profile.getPlatform() : "";
+        ios = ua.contains("iPhone") || ua.contains("iPad") || ua.contains("CPU iPhone OS") || platform.toLowerCase().contains("iphone") || platform.toLowerCase().contains("ipad");
+
+        String navPlatform = ios ? (ua.contains("iPad") ? "iPad" : "iPhone") : "Linux armv8l";
+        String navVendor = ios ? "Apple Computer, Inc." : "Google Inc.";
+
+        // ВАЖНО: делаем только то, что реально можно “подправить” без ломания сайтов:
+        // - navigator.platform / vendor через defineProperty
+        // - navigator.webdriver=false
+        // - iOS: прячем userAgentData (Safari обычно его не имеет), window.chrome -> undefined
+        return """
+        (function() {
+          try {
+            const isIOS = %s;
+
+            const define = (obj, prop, val) => {
+              try {
+                Object.defineProperty(obj, prop, {
+                  get: () => val,
+                  configurable: true
+                });
+              } catch (e) {}
+            };
+
+            // webdriver
+            try {
+              define(Navigator.prototype, 'webdriver', false);
+            } catch (e) {}
+
+            // platform + vendor
+            try { define(Navigator.prototype, 'platform', %s); } catch (e) {}
+            try { define(Navigator.prototype, 'vendor', %s); } catch (e) {}
+
+            if (isIOS) {
+              // Safari-like: no userAgentData
+              try { define(Navigator.prototype, 'userAgentData', undefined); } catch (e) {}
+              // window.chrome отсутствует
+              try { define(window, 'chrome', undefined); } catch (e) {}
+            }
+          } catch (e) {}
+        })();
+        """.formatted(
+                ios ? "true" : "false",
+                jsString(navPlatform),
+                jsString(navVendor)
+        );
+    }
+
+    private String jsString(String s) {
+        if (s == null) s = "";
+        return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'";
     }
 
     /**
@@ -1306,4 +1385,101 @@ public class BrowserScriptInjector {
 
         return true;
     }
+
+    /**
+     * ✅ Инжект через уже открытую CDP-сессию (page target).
+     * Только Page.addScriptToEvaluateOnNewDocument (без второго WS).
+     */
+    public int injectForProfile(Long profileId, DevToolsSession cdp) {
+        if (!injectEnabled) {
+            log.debug("CDP injection disabled");
+            return 0;
+        }
+        if (cdp == null) {
+            log.warn("injectForProfile: cdp is null (profileId={})", profileId);
+            return 0;
+        }
+
+        Profile profile = profileRepository.findById(profileId).orElse(null);
+        if (profile == null) {
+            log.warn("injectForProfile: profile not found (profileId={})", profileId);
+            return 0;
+        }
+
+        List<String> scripts = qaScriptGenerator.generateAll(profile);
+        if (scripts == null || scripts.isEmpty()) {
+            log.debug("injectForProfile: no scripts (profileId={})", profileId);
+            return 0;
+        }
+
+        int added = 0;
+        long totalBytes = 0;
+
+        for (String src : scripts) {
+            if (src == null || src.isBlank()) continue;
+
+            int bytes = src.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+
+            if (bytes > maxScriptBytes) {
+                log.warn("Skip script: too large ({} bytes > {}), profileId={}", bytes, maxScriptBytes, profileId);
+                continue;
+            }
+            if (totalBytes + bytes > maxTotalBytes) {
+                log.warn("Stop injecting: total bytes limit reached ({} > {}), profileId={}",
+                        (totalBytes + bytes), maxTotalBytes, profileId);
+                break;
+            }
+
+            // ✅ важное: работает только в page-WS
+            cdp.send("Page.addScriptToEvaluateOnNewDocument",
+                    Map.of("source", src),
+                    cmdTimeoutMs);
+
+            added++;
+            totalBytes += bytes;
+        }
+
+        log.info("Injected {} script(s) via existing CDP session (profileId={}, totalBytes={})",
+                added, profileId, totalBytes);
+
+        return added;
+    }
+
+
+
+
+    public boolean injectScripts(String wsUrl, Long profileId, List<String> scripts) {
+        try (DevToolsSession cdp = devToolsClient.connect(wsUrl)) {
+
+            long cmdTimeoutMs = 3000; // или @Value("${browser.cdp.cmd-timeout-ms:3000}")
+            cdp.enableCommonDomains(cmdTimeoutMs);
+
+            for (String src : scripts) {
+                if (src == null || src.isBlank()) continue;
+
+                cdp.send("Page.addScriptToEvaluateOnNewDocument",
+                        Map.of("source", src),
+                        cmdTimeoutMs
+                );
+            }
+
+            // опционально: применить сразу, если страница уже открыта
+            for (String src : scripts) {
+                if (src == null || src.isBlank()) continue;
+                cdp.send("Runtime.evaluate",
+                        Map.of("expression", src, "returnByValue", true),
+                        cmdTimeoutMs
+                );
+            }
+
+            log.info("Injected {} script(s) via CDP (profileId={})", scripts.size(), profileId);
+            return true;
+
+        } catch (Exception e) {
+            log.warn("CDP injection failed (profileId={}): {}", profileId, e.getMessage(), e);
+            return false;
+        }
+    }
+
 }
+

@@ -93,10 +93,11 @@ public class IntegrationProfileController {
     @PostMapping("/{externalKey}/stop")
     @Operation(summary = "Остановить браузер для профиля по externalKey")
     public ResponseEntity<IntegrationStopResponse> stop(@PathVariable String externalKey) {
-        log.info("Integration stop request for externalKey: {}", externalKey);
+        String safeKey = sanitizeExternalKey(externalKey);
+        log.info("Integration stop request for externalKey: {}", safeKey);
 
         try {
-            return profileRepository.findByExternalKey(externalKey)
+            return profileRepository.findByExternalKey(safeKey)
                     .map(profile -> {
                         boolean stopped = browserContainerService.stopBrowser(profile.getId());
 
@@ -161,10 +162,11 @@ public class IntegrationProfileController {
     @GetMapping("/{externalKey}/status")
     @Operation(summary = "Получить статус профиля по externalKey")
     public ResponseEntity<IntegrationStatusResponse> getStatus(@PathVariable String externalKey) {
-        log.debug("Integration status request for externalKey: {}", externalKey);
+        String safeKey = sanitizeExternalKey(externalKey);
+        log.debug("Integration status request for externalKey: {}", safeKey);
 
         try {
-            return profileRepository.findByExternalKey(externalKey)
+            return profileRepository.findByExternalKey(safeKey)
                     .map(profile -> {
                         boolean isRunning = browserContainerService.isBrowserRunning(profile.getId());
                         var containerInfo = browserContainerService.getContainerInfo(profile.getId());
@@ -498,4 +500,15 @@ public class IntegrationProfileController {
         private Boolean isMobile;
         private String description;
     }
+
+    private String sanitizeExternalKey(String key) {
+        if (key == null) return "";
+        String s = key.trim();
+        s = s.replaceAll("\\s+", "");
+        s = s.replaceAll("[^0-9A-Za-z_-]", "_");
+        if (s.length() > 100) s = s.substring(0, 100);
+        s = s.replaceAll("^[._]+", "");
+        return s;
+    }
+
 }

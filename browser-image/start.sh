@@ -21,9 +21,12 @@ USER_DATA_DIR="${USER_DATA_DIR:-/data/user-data}"
 LANGUAGE_SAFE="${LANGUAGE:-en-US}"
 TZ_SAFE="${TIMEZONE:-${TZ:-}}"
 
+# Наружный DevTools порт (его пробрасывает Docker)
 DEVTOOLS_PORT="${DEVTOOLS_PORT:-9223}"
-NOVNC_PORT="${NOVNC_PORT:-6080}"
+# Внутренний порт Chromium (loopback, всегда стабильно)
+DEVTOOLS_PORT_INTERNAL="${DEVTOOLS_PORT_INTERNAL:-9222}"
 
+NOVNC_PORT="${NOVNC_PORT:-6080}"
 
 CHROMIUM_BIN="${CHROMIUM_BIN:-$(command -v chromium || true)}"
 if [[ -z "${CHROMIUM_BIN}" ]]; then
@@ -35,6 +38,7 @@ CHROME_PID=""
 CHROME_PGID=""
 XVFB_PID=""
 SYNC_PID=""
+SOCAT_PID=""
 
 # =============================
 # helpers
@@ -45,7 +49,6 @@ get_pgid() {
 }
 
 start_sync_loop() {
-  # Периодически флашим файловую систему (актуально для bind mount на Windows)
   (
     while true; do
       [[ -n "${CHROME_PID}" ]] && kill -0 "${CHROME_PID}" 2>/dev/null || exit 0
@@ -66,7 +69,6 @@ stop_process_group_gracefully() {
   kill -TERM "-${pgid}" 2>/dev/null || true
 
   for _ in $(seq 1 45); do
-    # если в группе процессов уже никого нет — выходим
     if ! ps -o pid= --pgid "${pgid}" 2>/dev/null | grep -q '[0-9]'; then
       return 0
     fi
@@ -86,19 +88,20 @@ stop_process_group_gracefully() {
 cleanup() {
   log "=== SHUTDOWN ==="
 
-  # останавливаем sync loop
   if [[ -n "${SYNC_PID}" ]] && kill -0 "${SYNC_PID}" 2>/dev/null; then
     kill -TERM "${SYNC_PID}" 2>/dev/null || true
   fi
 
-  # дать шанс дописать профиль
+  if [[ -n "${SOCAT_PID}" ]] && kill -0 "${SOCAT_PID}" 2>/dev/null; then
+    kill -TERM "${SOCAT_PID}" 2>/dev/null || true
+  fi
+
   if [[ -n "${CHROME_PID}" ]] && kill -0 "${CHROME_PID}" 2>/dev/null; then
     log "Pre-shutdown wait (flush profile to disk)..."
     sync || true
     sleep 8
   fi
 
-  # останавливаем chromium как process-group
   if [[ -n "${CHROME_PGID}" ]]; then
     stop_process_group_gracefully "${CHROME_PGID}" "Chromium"
   elif [[ -n "${CHROME_PID}" ]] && kill -0 "${CHROME_PID}" 2>/dev/null; then
@@ -109,10 +112,10 @@ cleanup() {
   sync || true
   sleep 2
 
-  pkill -TERM -f "socat TCP-LISTEN:${DEVTOOLS_PROXY_PORT}" 2>/dev/null || true
   pkill -TERM -f "novnc_proxy|websockify" 2>/dev/null || true
   pkill -TERM -f "x11vnc" 2>/dev/null || true
   pkill -TERM -f "fluxbox" 2>/dev/null || true
+  pkill -TERM -f "socat.*TCP-LISTEN:${DEVTOOLS_PORT}" 2>/dev/null || true
 
   if [[ -n "${XVFB_PID}" ]] && kill -0 "${XVFB_PID}" 2>/dev/null; then
     log "Stopping Xvfb..."
@@ -172,7 +175,6 @@ echo "ok" > "${TEST_FILE}" 2>/dev/null || {
 }
 rm -f "${TEST_FILE}" 2>/dev/null || true
 
-# удаляем только локи
 find "${USER_DATA_DIR}" -maxdepth 2 -name "Singleton*" -delete 2>/dev/null || true
 
 log "Profile dir: ${USER_DATA_DIR}"
@@ -239,8 +241,9 @@ CHROME_ARGS=(
   "--disable-dev-shm-usage"
   "--disable-session-crashed-bubble"
 
-  "--remote-debugging-address=0.0.0.0"
-  "--remote-debugging-port=${DEVTOOLS_PORT}"
+  # Важно: Chromium слушает только внутри (loopback) — наружу отдаём через socat
+  "--remote-debugging-address=127.0.0.1"
+  "--remote-debugging-port=${DEVTOOLS_PORT_INTERNAL}"
   "--remote-allow-origins=*"
 
   "--password-store=basic"
@@ -266,19 +269,36 @@ fi
 start_sync_loop
 
 # =============================
-# DevTools wait
+# DevTools wait (INTERNAL)
 # =============================
-log "Waiting for DevTools API..."
+log "Waiting for INTERNAL DevTools API..."
 for i in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:${DEVTOOLS_PORT}/json/version" >/dev/null 2>&1; then
-    log "DevTools ready after ${i}s"
+  if curl -fsS "http://127.0.0.1:${DEVTOOLS_PORT_INTERNAL}/json/version" >/dev/null 2>&1; then
+    log "Internal DevTools ready after ${i}s (port ${DEVTOOLS_PORT_INTERNAL})"
     break
   fi
   sleep 1
 done
 
-#log "Starting DevTools proxy :${DEVTOOLS_PROXY_PORT} -> :${DEVTOOLS_PORT}"
-#socat "TCP-LISTEN:${DEVTOOLS_PROXY_PORT},fork,reuseaddr" "TCP:127.0.0.1:${DEVTOOLS_PORT}" >/tmp/socat.log 2>&1 &
+# =============================
+# DevTools proxy (EXTERNAL) 9223 -> 9222
+# =============================
+if command -v socat >/dev/null 2>&1; then
+  log "Starting DevTools proxy 0.0.0.0:${DEVTOOLS_PORT} -> 127.0.0.1:${DEVTOOLS_PORT_INTERNAL}"
+  socat "TCP-LISTEN:${DEVTOOLS_PORT},fork,reuseaddr" "TCP:127.0.0.1:${DEVTOOLS_PORT_INTERNAL}" >/tmp/socat.log 2>&1 &
+  SOCAT_PID=$!
+else
+  log "WARN: socat not found, external DevTools may not work"
+fi
+
+log "Waiting for EXTERNAL DevTools API..."
+for i in $(seq 1 60); do
+  if curl -fsS "http://127.0.0.1:${DEVTOOLS_PORT}/json/version" >/dev/null 2>&1; then
+    log "External DevTools ready after ${i}s (port ${DEVTOOLS_PORT})"
+    break
+  fi
+  sleep 1
+done
 
 # =============================
 # FIX geometry
@@ -306,15 +326,13 @@ fi
 
 log "=== STARTUP COMPLETE ==="
 log "noVNC:    http://localhost:${NOVNC_PORT}/vnc.html"
-log "DevTools: http://localhost:${DEVTOOLS_PORT}"
-#log "Proxy:    http://localhost:${DEVTOOLS_PROXY_PORT}"
+log "DevTools: http://localhost:${DEVTOOLS_PORT} (proxy -> ${DEVTOOLS_PORT_INTERNAL})"
 log "Profile:  ${USER_DATA_DIR}"
 log "Xvfb:     ${SCREEN_GEOMETRY}"
 log "Note:     DPR is handled by DevTools emulation (PIXEL_RATIO=${PIXEL_RATIO})"
 
 wait "${CHROME_PID}" || true
 
-# финальный flush после выхода chromium
 sync || true
 sleep 2
 

@@ -58,6 +58,7 @@ public class DeviceProfile {
     // Метаданные
     private Instant generatedAt;        // Когда сгенерирован
     private Boolean withVariations;     // С вариациями или нет
+    private Boolean mobile;     // С вариациями или нет
 
     /**
      * Получает строку разрешения экрана

@@ -17,30 +17,40 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.java_websocket.client.WebSocketClient;
-import org.java_websocket.handshake.ServerHandshake;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
 import com.hunt.peoples.browser.config.DevToolsSession;
-
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
-import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
+import com.github.dockerjava.api.model.*;
+import org.springframework.web.client.RestTemplate;
 
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+
+/**
+ * Запуск контейнера + базовая CDP-настройка для QA/эмуляции устройства:
+ * - viewport / touch / locale / timezone
+ * - UA override (если задан в профиле)
+ *
+ * НЕ содержит логики "обхода детекта" / скрытия сигналов.
+ */
 
 @Service
 @RequiredArgsConstructor
@@ -51,17 +61,20 @@ public class BrowserContainerService {
     private final AppProperties appProperties;
     private final ProfileRepository profileRepository;
     private final ObjectMapper objectMapper;
-    private final BrowserScriptInjector scriptInjector;
-    private final FingerprintMonitor fingerprintMonitor;
+    private final BrowserScriptInjector scriptInjector;      // используется только если injectScripts=true
+    private final FingerprintMonitor fingerprintMonitor;     // опционально
     private final DevToolsClient devToolsClient;
 
     private static final String IMAGE_NAME = "multi-browser-chrome-vnc";
-    private static final int VNC_CONTAINER_PORT = 6080;
-    private static final int DEVTOOLS_CONTAINER_PORT = 9223;
+    private static final int VNC_CONTAINER_PORT = 6080;      // noVNC из start.sh
+    private static final int DEVTOOLS_CONTAINER_PORT = 9223; // EXTERNAL DevTools (через socat proxy в start.sh)
 
     private static final Map<Long, ContainerInfo> ACTIVE_CONTAINERS = new ConcurrentHashMap<>();
     private final ExecutorService executorService = Executors.newCachedThreadPool();
     private final ConcurrentHashMap<Long, ReentrantLock> STOP_LOCKS = new ConcurrentHashMap<>();
+
+    @Value("${browser.devtools.debug-json:false}")
+    private boolean debugDevtoolsJson;
 
     @Value("${browser.container.memory.mb:2048}")
     private int containerMemoryMB;
@@ -72,17 +85,14 @@ public class BrowserContainerService {
     @Value("${browser.container.startup.timeout:60}")
     private int startupTimeoutSeconds;
 
-    @Value("${browser.container.inject-scripts:true}")
+    @Value("${browser.container.inject-scripts:false}")
     private boolean injectScripts;
 
-    @Value("${browser.container.monitor-on-start:true}")
+    @Value("${browser.container.monitor-on-start:false}")
     private boolean monitorOnStart;
 
     @Value("${browser.devtools.websocket.connect-timeout:5000}")
     private int websocketConnectTimeout;
-
-    @Value("${browser.devtools.websocket.read-timeout:10000}")
-    private int websocketReadTimeout;
 
     @Value("${browser.container.shm-size.mb:512}")
     private int shmSizeMB;
@@ -90,14 +100,15 @@ public class BrowserContainerService {
     @Value("${browser.container.max-containers:50}")
     private int maxContainers;
 
+    @Value("${browser.container.relax-security:false}")
+    private boolean relaxSecurity;
+
     @PostConstruct
     public void init() {
-        log.info("BrowserContainerService initialized with:");
-        log.info("  - Memory per container: {} MB", containerMemoryMB);
-        log.info("  - Max containers: {}", maxContainers);
-        log.info("  - SHM size: {} MB", shmSizeMB);
-        log.info("  - Script injection: {}", injectScripts);
-        log.info("  - Monitor on start: {}", monitorOnStart);
+        log.info("BrowserContainerService init:");
+        log.info("  memory={}MB cpuShares={} shm={}MB maxContainers={}", containerMemoryMB, containerCpuShares, shmSizeMB, maxContainers);
+        log.info("  injectScripts={} monitorOnStart={} relaxSecurity={}", injectScripts, monitorOnStart, relaxSecurity);
+        log.info("  image={}", IMAGE_NAME);
     }
 
     public BrowserStartResult startBrowser(Profile profile, String proxyOverride) {
@@ -105,25 +116,22 @@ public class BrowserContainerService {
         String userDataDir = profile.getUserDataPath();
         String hostBaseUrl = appProperties.getHostBaseUrl();
         String externalKey = profile.getExternalKey();
-
         String containerName = "browser_profile_" + profileId;
 
-        log.info("=== STARTING BROWSER CONTAINER ===");
-        log.info("Container: {} for profile {} ({})", containerName, profileId, externalKey);
-        log.info("User data path: {}", userDataDir);
+        log.info("=== START BROWSER === profileId={} externalKey={} container={}", profileId, externalKey, containerName);
 
         checkContainerLimit();
 
         if (ACTIVE_CONTAINERS.containsKey(profileId)) {
             ContainerInfo existing = ACTIVE_CONTAINERS.get(profileId);
-            throw new IllegalStateException("Browser already running for profile " + profileId +
-                    " container=" + existing.getContainerName());
+            throw new IllegalStateException("Browser already running for profile=" + profileId + " container=" + existing.getContainerName());
         }
 
         cleanupOldContainerGracefully(containerName);
 
-        int hostVncPort = findFreePort();
-        int hostDevToolsPort = findFreePort();
+        int[] ports = findTwoDistinctFreePorts();
+        int hostVncPort = ports[0];
+        int hostDevToolsPort = ports[1];
 
         ExposedPort vncPort = ExposedPort.tcp(VNC_CONTAINER_PORT);
         ExposedPort devToolsPort = ExposedPort.tcp(DEVTOOLS_CONTAINER_PORT);
@@ -138,14 +146,17 @@ public class BrowserContainerService {
         HostConfig hostConfig = HostConfig.newHostConfig()
                 .withPortBindings(portBindings)
                 .withBinds(new Bind(hostPath, new Volume("/data/user-data")))
-                .withMemory(containerMemoryMB * 1024 * 1024L)
-                .withMemorySwap((containerMemoryMB * 2L) * 1024 * 1024L)
+                .withMemory(containerMemoryMB * 1024L * 1024L)
+                .withMemorySwap(containerMemoryMB * 2L * 1024L * 1024L)
                 .withCpuShares(containerCpuShares)
                 .withPrivileged(false)
                 .withShmSize(shmSizeMB * 1024L * 1024L)
-                .withRestartPolicy(RestartPolicy.noRestart())
-                .withCapAdd(Capability.valueOf("SYS_ADMIN"))
-                .withSecurityOpts(Arrays.asList("seccomp=unconfined", "apparmor=unconfined"));
+                .withRestartPolicy(RestartPolicy.noRestart());
+
+        if (relaxSecurity) {
+            hostConfig.withCapAdd(Capability.SYS_ADMIN);
+            hostConfig.withSecurityOpts(Arrays.asList("seccomp=unconfined", "apparmor=unconfined"));
+        }
 
         List<String> envVars = prepareEnvironmentVars(profile, proxyOverride);
 
@@ -163,7 +174,7 @@ public class BrowserContainerService {
         String containerId = container.getId();
         dockerClient.startContainerCmd(containerId).exec();
 
-        ContainerInfo containerInfo = ContainerInfo.builder()
+        ContainerInfo info = ContainerInfo.builder()
                 .containerId(containerId)
                 .containerName(containerName)
                 .profileId(profileId)
@@ -171,30 +182,40 @@ public class BrowserContainerService {
                 .hostDevToolsPort(hostDevToolsPort)
                 .startedAt(Instant.now())
                 .build();
-
-        ACTIVE_CONTAINERS.put(profileId, containerInfo);
+        ACTIVE_CONTAINERS.put(profileId, info);
 
         String vncUrl = buildVncUrl(hostBaseUrl, hostVncPort);
         String devToolsUrl = buildDevToolsUrl(hostBaseUrl, hostDevToolsPort);
 
         waitForVncReady(vncUrl, Duration.ofSeconds(startupTimeoutSeconds));
-        waitForDevToolsReady(devToolsUrl, Duration.ofSeconds(20));
+        waitForDevToolsReady(devToolsUrl, Duration.ofSeconds(40)); // чуть больше, но стабильно
 
-        // === ВОТ ЗДЕСЬ ВСЁ CDP: эмуляция + addScriptToEvaluateOnNewDocument + reload + verify ===
-        configureBrowserViaCdp(devToolsUrl, profile);
+        // 1) читаем реальную версию Chromium/Chrome (для логов/метаданных)
+        DevtoolsVersion dv = fetchDevtoolsVersionSafe(devToolsUrl);
+        if (dv != null) {
+            log.info("DevTools version (profile={}): browser='{}' ua='{}'", profileId, dv.browser, dv.userAgent);
+
+            if (dv.major > 0) {
+                maybeSyncAndroidUaMajor(profileId, dv.major);
+                updateProfileChromeMajor(profileId, dv.major);
+            }
+        }
+
+        // 2) CDP: emulation (viewport/touch/locale/tz/ua)
+        configureBrowserViaCdp(devToolsUrl, profileId);
 
         updateProfileStatus(profileId, "BUSY");
 
         if (monitorOnStart) {
-            monitorFingerprintAfterStart(profile);
+            monitorFingerprintAfterStart(profileId);
         }
 
-        log.info("=== BROWSER CONTAINER STARTED SUCCESSFULLY ===");
+        log.info("=== START OK === profileId={} vncUrl={} devToolsUrl={}", profileId, vncUrl, devToolsUrl);
 
         return BrowserStartResult.builder()
                 .profileId(profileId)
-                .vncUrl(vncUrl)
                 .externalKey(externalKey)
+                .vncUrl(vncUrl)
                 .devToolsUrl(devToolsUrl)
                 .containerId(containerId)
                 .startedAt(Instant.now())
@@ -203,55 +224,61 @@ public class BrowserContainerService {
     }
 
     /**
-     * CDP: единая точка — тут весь порядок действий.
+     * CDP конфигурация для “эмуляции устройства” (размер/тач/таймзона/locale).
      */
-    private void configureBrowserViaCdp(String devToolsUrl, Profile profile) {
-        String wsUrl = getDevToolsWebSocketUrl(devToolsUrl);
-        if (wsUrl == null) {
-            log.warn("DevTools wsUrl is null -> skip CDP config (profile={})", profile.getId());
+    private void configureBrowserViaCdp(String devToolsUrl, Long profileId) {
+        Profile profile = profileRepository.findById(profileId).orElse(null);
+        if (profile == null) return;
+
+        String pageWsUrl = getDevToolsWebSocketUrl(devToolsUrl);
+        if (pageWsUrl == null) {
+            log.warn("DevTools PAGE wsUrl is null -> skip CDP config (profile={})", profileId);
             return;
         }
+        if (!pageWsUrl.contains("/devtools/page/")) {
+            log.warn("Refuse CDP: wsUrl is not PAGE target: {} (profile={})", pageWsUrl, profileId);
+            return;
+        }
+        log.info("CDP target ws (profile={}): {}", profileId, pageWsUrl);
 
-        try (DevToolsSession cdp = devToolsClient.connect(wsUrl, websocketConnectTimeout, 30)) {
 
-            cdp.send("Page.enable", Map.of(), 3000);
-            cdp.send("Network.enable", Map.of(), 3000);
-            cdp.send("Runtime.enable", Map.of(), 3000);
+        try (DevToolsSession cdp = devToolsClient.connect(pageWsUrl, websocketConnectTimeout, 30)) {
 
-            // 1) Эмуляция
-            applyMobileEmulation(cdp, profile);
+            // включаем домены 1 раз
+            cdp.enableCommonDomains(3000);
 
-            // 2) Скрипты ранней инъекции
-            if (injectScripts && shouldInjectScripts(profile)) {
-                String bundle = buildInjectionBundle(profile);
-                if (bundle != null && !bundle.isBlank()) {
-                    cdp.send("Page.addScriptToEvaluateOnNewDocument", Map.of("source", bundle), 5000);
-                    log.info("Anti-detection attached (profile={})", profile.getId());
-                }
+            // 1) emulation (viewport/touch/ua/locale/tz)
+            applyDeviceEmulation(cdp, profile);
+
+            // 2) inject (только addScriptToEvaluateOnNewDocument)
+            int injected = 0;
+            if (injectScripts) {
+                scriptInjector.injectForProfile(profileId, cdp);
             }
 
-            // 3) reload
-            cdp.send("Page.reload", Map.of("ignoreCache", true), 10000);
-
-            // 4) verify
-            if (injectScripts && shouldInjectScripts(profile)) {
-                verifyScriptInjection(cdp, profile);
+            // 3) reload — чтобы скрипты точно применились
+            if (injectScripts && injected > 0) {
+                cdp.send("Page.reload", Map.of("ignoreCache", true), 15000);
             }
+
+            verifyCdpBasic(cdp, profileId);
 
         } catch (Exception e) {
-            log.warn("configureBrowserViaCdp failed (profile={}): {}", profile.getId(), e.getMessage(), e);
+            log.warn("configureBrowserViaCdp failed (profile={}): {}", profileId, e.getMessage(), e);
         }
     }
 
 
-    private void applyMobileEmulation(DevToolsSession cdp, Profile profile) throws Exception {
+
+
+    private void applyDeviceEmulation(DevToolsSession cdp, Profile profile) {
         boolean mobile = isMobileProfile(profile);
 
         int width = safeInt(profile.getScreenWidth(), mobile ? 390 : 1920);
         int height = safeInt(profile.getScreenHeight(), mobile ? 844 : 1080);
 
-        if (mobile && width > 700) width = 390;
-        if (mobile && height > 1200) height = 844;
+        if (mobile && width > 1200) width = 1024;
+        if (mobile && height > 2000) height = 1366;
 
         double dpr = safeDouble(profile.getPixelRatio(), mobile ? 3.0 : 1.0);
 
@@ -279,12 +306,6 @@ public class BrowserContainerService {
             Map<String, Object> uaParams = new HashMap<>();
             uaParams.put("userAgent", ua);
             uaParams.put("acceptLanguage", profile.getLanguage() != null ? profile.getLanguage() : "en-US");
-
-//            Map<String, Object> uaMeta = new HashMap<>();
-//            uaMeta.put("mobile", mobile);
-//            uaMeta.put("platform", detectPlatformForUaCh(profile, ua, mobile));
-//            uaParams.put("userAgentMetadata", uaMeta);
-
             cdp.send("Network.setUserAgentOverride", uaParams, 5000);
         }
 
@@ -295,31 +316,11 @@ public class BrowserContainerService {
             cdp.send("Emulation.setTimezoneOverride", Map.of("timezoneId", profile.getTimezone()), 3000);
         }
 
-        log.info("Mobile emulation applied (profile={}): mobile={}, {}x{}, dpr={}",
+        log.info("Emulation applied (profile={}): mobile={}, {}x{}, dpr={}",
                 profile.getId(), mobile, width, height, dpr);
     }
 
-
-
-    private String buildInjectionBundle(Profile profile) {
-        StringBuilder sb = new StringBuilder();
-
-        String base = scriptInjector.generateInjectionScript(profile);
-        if (base != null && !base.isBlank()) sb.append(base).append("\n;\n");
-
-        String media = scriptInjector.generateMediaDevicesScript(profile);
-        if (media != null && !media.isBlank()) sb.append(media).append("\n;\n");
-
-        String webgl = scriptInjector.generateWebGLExtensionsScript(profile);
-        if (webgl != null && !webgl.isBlank()) sb.append(webgl).append("\n;\n");
-
-        String audio = scriptInjector.generateAudioScript(profile);
-        if (audio != null && !audio.isBlank()) sb.append(audio).append("\n;\n");
-
-        return sb.toString();
-    }
-
-    private void verifyScriptInjection(DevToolsSession cdp, Profile profile) {
+    private void verifyCdpBasic(DevToolsSession cdp, Long profileId) {
         try {
             String js = """
                 (function() {
@@ -327,6 +328,7 @@ public class BrowserContainerService {
                     webdriver: navigator.webdriver,
                     ua: navigator.userAgent,
                     platform: navigator.platform,
+                    vendor: navigator.vendor,
                     w: screen.width,
                     h: screen.height,
                     tz: Intl.DateTimeFormat().resolvedOptions().timeZone
@@ -339,64 +341,283 @@ public class BrowserContainerService {
                     5000);
 
             JsonNode value = resp.path("result").path("result").path("value");
-            log.info("Verify (profile={}): {}", profile.getId(), value);
+            log.info("Verify (profile={}): {}", profileId, value);
 
         } catch (Exception e) {
-            log.debug("verifyScriptInjection failed (profile={}): {}", profile.getId(), e.getMessage());
+            log.debug("verifyCdpBasic failed (profile={}): {}", profileId, e.getMessage());
         }
     }
-    private String resolveProxy(String proxyOverride, String profileProxy) {
-        String o = proxyOverride != null ? proxyOverride.trim() : "";
-        if (!o.isBlank()) return o;
 
-        String p = profileProxy != null ? profileProxy.trim() : "";
-        return p.isBlank() ? null : p;
-    }
-
-
+    // -------------------- DevTools URLs --------------------
 
     /**
-     * Получаем wsUrl из http://host:port/json/list (или /json как fallback).
+     * ✅ Самый надёжный способ: /json/version часто содержит webSocketDebuggerUrl напрямую.
+     * Потом fallback на /json/list.
      */
+
+//    private String getDevToolsWebSocketUrl(String devToolsUrl) {
+//        RestTemplate rt = restTemplate(2500, 2500);
+//        String base = devToolsUrl.endsWith("/") ? devToolsUrl.substring(0, devToolsUrl.length() - 1) : devToolsUrl;
+//
+//        try {
+//            // 1) СНАЧАЛА создаём page-target и берём ws прямо из ответа
+//            JsonNode created = rt.getForObject(base + "/json/new?about%3Ablank", JsonNode.class);
+//            String ws = created != null ? created.path("webSocketDebuggerUrl").asText(null) : null;
+//
+//            if (isPageWs(ws)) {
+//                log.info("Resolved PAGE ws from /json/new: {}", ws);
+//                return ws;
+//            }
+//
+//            // 2) fallback: ищем page в list
+//            ws = findAnyPageWs(rt, base);
+//            if (isPageWs(ws)) {
+//                log.info("Resolved PAGE ws from /json/list: {}", ws);
+//                return ws;
+//            }
+//
+//            // 3) если совсем ничего — логируем list для диагностики
+//            JsonNode list = rt.getForObject(base + "/json/list", JsonNode.class);
+//            log.warn("PAGE ws not found. /json/new ws='{}', list='{}'", ws, list);
+//
+//            return null;
+//
+//        } catch (Exception e) {
+//            log.warn("Failed to resolve PAGE DevTools wsUrl from {}: {}", base, e.getMessage());
+//            return null;
+//        }
+//    }
+
     private String getDevToolsWebSocketUrl(String devToolsUrl) {
+        RestTemplate rt = restTemplate(1500, 1500);
+        String base = devToolsUrl.endsWith("/") ? devToolsUrl.substring(0, devToolsUrl.length() - 1) : devToolsUrl;
+
+        // 1) ждём существующую страницу
+        for (int attempt = 1; attempt <= 15; attempt++) {
+            String ws = findAnyPageWs(rt, base, attempt);
+            if (ws != null) return ws;
+            sleep(200);
+        }
+
+        // 2) если page нет — создаём (PUT), затем снова ждём
+        boolean created = createNewPageViaPut(rt, base, "about:blank");
+        if (created) {
+            for (int attempt = 16; attempt <= 30; attempt++) {
+                String ws = findAnyPageWs(rt, base, attempt);
+                if (ws != null) return ws;
+                sleep(200);
+            }
+        }
+
+        log.warn("DevTools PAGE wsUrl not found after retries (created={}): {}", created, base);
+        return null;
+    }
+
+
+
+    private boolean createNewPageViaPut(RestTemplate rt, String base, String url) {
         try {
-            RestTemplate rt = new RestTemplate();
-            SimpleClientHttpRequestFactory f = new SimpleClientHttpRequestFactory();
-            f.setConnectTimeout(3000);
-            f.setReadTimeout(3000);
-            rt.setRequestFactory(f);
+            String q = java.net.URLEncoder.encode(url, java.nio.charset.StandardCharsets.UTF_8);
+            String u = base + "/json/new?" + q;
 
-            String response;
-            try {
-                response = rt.getForObject(devToolsUrl + "/json/list", String.class);
-            } catch (Exception e) {
-                response = rt.getForObject(devToolsUrl + "/json", String.class);
-            }
+            var resp = rt.exchange(u, org.springframework.http.HttpMethod.PUT,
+                    org.springframework.http.HttpEntity.EMPTY,
+                    com.fasterxml.jackson.databind.JsonNode.class);
 
-            if (response == null || response.isBlank()) return null;
+            boolean ok = resp.getStatusCode().is2xxSuccessful();
+            log.info("[DevTools] PUT {} -> {}", u, resp.getStatusCode());
+            return ok;
+        } catch (Exception e) {
+            log.warn("Failed to create DevTools page via PUT: {} ({})", base, e.getMessage());
+            return false;
+        }
+    }
 
-            JsonNode nodes = objectMapper.readTree(response);
-            if (!nodes.isArray() || nodes.size() == 0) return null;
 
-            for (JsonNode node : nodes) {
-                if ("page".equals(node.path("type").asText()) && node.has("webSocketDebuggerUrl")) {
-                    return node.get("webSocketDebuggerUrl").asText();
+    private void logTargetsPreview(JsonNode list, String base, int attempt) {
+        if (!debugDevtoolsJson) return;
+
+        int n = (list != null && list.isArray()) ? list.size() : -1;
+        log.info("[DevTools] /json/list attempt={} base={} targets={}", attempt, base, n);
+
+        if (list == null || !list.isArray()) return;
+
+        int max = Math.min(list.size(), 5);
+        for (int i = 0; i < max; i++) {
+            JsonNode t = list.get(i);
+            String type = t.path("type").asText("");
+            String url  = t.path("url").asText("");
+            String ws   = t.path("webSocketDebuggerUrl").asText("");
+
+            // режем, чтобы не забивать логи
+            if (url.length() > 140) url = url.substring(0, 140) + "...";
+            if (ws.length() > 140) ws = ws.substring(0, 140) + "...";
+
+            log.info("[DevTools]   #{} type={} url='{}' ws='{}'", i, type, url, ws);
+        }
+    }
+
+
+    private boolean isPageWs(String ws) {
+        return ws != null && !ws.isBlank() && ws.contains("/devtools/page/");
+    }
+
+    private String findAnyPageWs(RestTemplate rt, String base, int attempt) {
+        try {
+            JsonNode list = rt.getForObject(base + "/json/list", JsonNode.class);
+            logTargetsPreview(list, base, attempt);
+
+            if (list == null || !list.isArray()) return null;
+
+            for (JsonNode t : list) {
+                String type = t.path("type").asText("");
+                String ws   = t.path("webSocketDebuggerUrl").asText(null);
+                String url  = t.path("url").asText("");
+
+                if (!"page".equals(type) || ws == null || ws.isBlank()) continue;
+                if (!ws.contains("/devtools/page/")) continue;
+                if (url.startsWith("devtools://") || url.startsWith("chrome-extension://")) continue;
+
+                if (debugDevtoolsJson) {
+                    log.info("[DevTools] ✅ selected PAGE ws on attempt={} -> {}", attempt, ws);
                 }
+                return ws;
             }
-            for (JsonNode node : nodes) {
-                if (node.has("webSocketDebuggerUrl")) {
-                    return node.get("webSocketDebuggerUrl").asText();
-                }
+            return null;
+
+        } catch (org.springframework.web.client.HttpStatusCodeException e) {
+            // покажет прям код/тело (важно!)
+            if (debugDevtoolsJson) {
+                log.warn("[DevTools] /json/list status={} body={}", e.getStatusCode(), safeCut(e.getResponseBodyAsString(), 400));
             }
             return null;
 
         } catch (Exception e) {
-            log.warn("Failed to get DevTools WebSocket URL: {}", e.getMessage());
+            // иногда парсер JsonNode может падать — посмотрим сырой ответ
+            if (debugDevtoolsJson) {
+                try {
+                    String raw = rt.getForObject(base + "/json/list", String.class);
+                    log.warn("[DevTools] /json/list parse failed: {} ; raw={}", e.getMessage(), safeCut(raw, 400));
+                } catch (Exception ignore) {
+                    log.warn("[DevTools] /json/list failed: {}", e.getMessage());
+                }
+            }
             return null;
         }
     }
 
-    // ================== STOP ==================
+    private String safeCut(String s, int max) {
+        if (s == null) return null;
+        s = s.replace("\n", "\\n").replace("\r", "\\r");
+        return s.length() <= max ? s : s.substring(0, max) + "...";
+    }
+
+//
+//
+//    private String getDevToolsPageWsUrl(String devToolsUrl) {
+//        RestTemplate rt = restTemplate(2500, 2500);
+//        String base = devToolsUrl.endsWith("/") ? devToolsUrl.substring(0, devToolsUrl.length() - 1) : devToolsUrl;
+//
+//        try {
+//            // 1) сначала ищем существующую page
+//            String ws = findAnyPageWs(rt, base);
+//            if (looksLikePageWs(ws)) return ws;
+//
+//            // 2) создаём page и берём ws сразу из ответа (это самый надёжный шаг)
+//            JsonNode created = rt.getForObject(base + "/json/new?about:blank", JsonNode.class);
+//            String createdWs = created != null ? created.path("webSocketDebuggerUrl").asText(null) : null;
+//            if (looksLikePageWs(createdWs)) return createdWs;
+//
+//            // 3) fallback: ещё раз list
+//            ws = findAnyPageWs(rt, base);
+//            if (looksLikePageWs(ws)) return ws;
+//
+//            return null;
+//
+//        } catch (Exception e) {
+//            log.warn("Failed to resolve PAGE wsUrl from {}: {}", base, e.getMessage());
+//            return null;
+//        }
+//    }
+//
+//    private boolean looksLikePageWs(String ws) {
+//        return ws != null && !ws.isBlank() && ws.contains("/devtools/page/");
+//    }
+
+
+
+
+
+
+    private DevtoolsVersion fetchDevtoolsVersionSafe(String devToolsUrl) {
+        try {
+            RestTemplate rt = restTemplate(2000, 3000);
+            String json = rt.getForObject(devToolsUrl + "/json/version", String.class);
+            if (json == null || json.isBlank()) return null;
+
+            JsonNode node = objectMapper.readTree(json);
+            String browser = node.path("Browser").asText("");
+            String ua = node.path("User-Agent").asText("");
+
+            int major = parseMajorFromBrowser(browser);
+
+            return new DevtoolsVersion(browser, ua, major);
+
+        } catch (Exception e) {
+            log.debug("fetchDevtoolsVersionSafe failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private int parseMajorFromBrowser(String browser) {
+        if (browser == null) return 0;
+        Matcher m = Pattern.compile("/(\\d{2,3})\\.", Pattern.CASE_INSENSITIVE).matcher(browser);
+        if (m.find()) {
+            try { return Integer.parseInt(m.group(1)); } catch (Exception ignore) {}
+        }
+        return 0;
+    }
+
+    private RestTemplate restTemplate(int connectMs, int readMs) {
+        SimpleClientHttpRequestFactory f = new SimpleClientHttpRequestFactory();
+        f.setConnectTimeout(connectMs);
+        f.setReadTimeout(readMs);
+        RestTemplate rt = new RestTemplate();
+        rt.setRequestFactory(f);
+        return rt;
+    }
+
+    // -------------------- URL builder (scheme/host/port) --------------------
+
+    private String buildUrlPreserveScheme(String hostBaseUrl, int port, String path) {
+        try {
+            String base = (hostBaseUrl == null || hostBaseUrl.isBlank()) ? "http://localhost" : hostBaseUrl.trim();
+            if (!base.startsWith("http://") && !base.startsWith("https://")) {
+                base = "http://" + base;
+            }
+
+            URI u = URI.create(base);
+
+            String scheme = (u.getScheme() == null) ? "http" : u.getScheme();
+            String host = (u.getHost() != null) ? u.getHost() : u.getAuthority();
+            if (host == null || host.isBlank()) host = "localhost";
+
+            URI out = new URI(scheme, null, host, port, path, null, null);
+            return out.toString();
+        } catch (Exception e) {
+            return "http://localhost:" + port + (path != null ? path : "");
+        }
+    }
+
+    private String buildVncUrl(String hostBaseUrl, int port) {
+        return buildUrlPreserveScheme(hostBaseUrl, port, "/vnc.html");
+    }
+
+    private String buildDevToolsUrl(String hostBaseUrl, int port) {
+        return buildUrlPreserveScheme(hostBaseUrl, port, null);
+    }
+
+    // -------------------- STOP --------------------
 
     public boolean stopBrowser(Long profileId) {
         final String containerName = "browser_profile_" + profileId;
@@ -445,19 +666,54 @@ public class BrowserContainerService {
         }
     }
 
-    // ================== HELPERS (твои/часть уже есть) ==================
+    // -------------------- ENV / start.sh compatibility --------------------
+
+    private List<String> prepareEnvironmentVars(Profile profile, String proxyOverride) {
+        List<String> env = new ArrayList<>();
+
+        env.add("USER_DATA_DIR=/data/user-data");
+        env.add("LANGUAGE=" + (profile.getLanguage() != null ? profile.getLanguage() : "en-US"));
+        if (profile.getTimezone() != null) env.add("TIMEZONE=" + profile.getTimezone());
+
+        // важное: снаружи DevTools = 9223, внутри chromium пусть будет 9222 (в start.sh)
+        env.add("DEVTOOLS_PORT=9223");
+        env.add("DEVTOOLS_PORT_INTERNAL=9222");
+
+        env.add("NOVNC_PORT=6080");
+
+        env.add("SCREEN_WIDTH=" + (profile.getScreenWidth() != null ? profile.getScreenWidth() : 1920));
+        env.add("SCREEN_HEIGHT=" + (profile.getScreenHeight() != null ? profile.getScreenHeight() : 1080));
+        env.add("SCREEN_COLOR_DEPTH=" + (profile.getScreenColorDepth() != null ? profile.getScreenColorDepth() : 24));
+
+        env.add("PROFILE_ID=" + profile.getId());
+        env.add("EXTERNAL_KEY=" + (profile.getExternalKey() != null ? profile.getExternalKey() : ""));
+        env.add("PROFILE_NAME=" + (profile.getName() != null ? profile.getName() : ""));
+
+        if (profile.getUserAgent() != null) env.add("USER_AGENT=" + profile.getUserAgent());
+
+        String proxyToUse = resolveProxy(proxyOverride, profile.getProxyUrl());
+        if (proxyToUse != null && !proxyToUse.isBlank()) {
+            env.add("PROXY_URL=" + proxyToUse);
+        }
+
+        return env;
+    }
+
+    private String resolveProxy(String proxyOverride, String profileProxy) {
+        String o = proxyOverride != null ? proxyOverride.trim() : "";
+        if (!o.isBlank()) return o;
+
+        String p = profileProxy != null ? profileProxy.trim() : "";
+        return p.isBlank() ? null : p;
+    }
+
+    // -------------------- Helpers --------------------
 
     private void checkContainerLimit() {
         int activeCount = ACTIVE_CONTAINERS.size();
         if (activeCount >= maxContainers) {
-            throw new IllegalStateException("Cannot start new container. Maximum limit reached: " + activeCount + "/" + maxContainers);
+            throw new IllegalStateException("Cannot start new container. Limit reached: " + activeCount + "/" + maxContainers);
         }
-    }
-
-    private boolean shouldInjectScripts(Profile profile) {
-        if (!injectScripts) return false;
-        String level = profile.getDetectionLevel();
-        return level != null && (level.equals("ENHANCED") || level.equals("AGGRESSIVE"));
     }
 
     private boolean isMobileProfile(Profile profile) {
@@ -465,16 +721,10 @@ public class BrowserContainerService {
         String platform = profile.getPlatform() != null ? profile.getPlatform() : "";
         Integer w = profile.getScreenWidth();
 
-        if (ua.contains("Android") || ua.contains("iPhone") || ua.contains("Mobile")) return true;
-        if (platform.toLowerCase().contains("android") || platform.toLowerCase().contains("iphone")) return true;
-        return w != null && w <= 500;
-    }
-
-    private String detectPlatformForUaCh(Profile profile, String ua, boolean mobile) {
-        String p = profile.getPlatform() != null ? profile.getPlatform().toLowerCase() : "";
-        if (p.contains("android") || ua.contains("Android")) return "Android";
-        if (p.contains("iphone") || ua.contains("iPhone")) return "iOS";
-        return mobile ? "Android" : "Windows";
+        if (ua.contains("Android") || ua.contains("iPhone") || ua.contains("Mobile") || ua.contains("iPad")) return true;
+        String pl = platform.toLowerCase();
+        if (pl.contains("android") || pl.contains("iphone") || pl.contains("ipad")) return true;
+        return w != null && w <= 800;
     }
 
     private int safeInt(Integer v, int def) { return (v == null || v <= 0) ? def : v; }
@@ -489,16 +739,11 @@ public class BrowserContainerService {
         }
     }
 
-    private String buildVncUrl(String hostBaseUrl, int port) {
-        if (hostBaseUrl == null || hostBaseUrl.isEmpty()) return "http://localhost:" + port + "/vnc.html";
-        String host = hostBaseUrl.replaceFirst("^https?://", "");
-        return "http://" + host + ":" + port + "/vnc.html";
-    }
-
-    private String buildDevToolsUrl(String hostBaseUrl, int port) {
-        if (hostBaseUrl == null || hostBaseUrl.isEmpty()) return "http://localhost:" + port;
-        String host = hostBaseUrl.replaceFirst("^https?://", "");
-        return "http://" + host + ":" + port;
+    private int[] findTwoDistinctFreePorts() {
+        int a = findFreePort();
+        int b = findFreePort();
+        while (b == a) b = findFreePort();
+        return new int[]{a, b};
     }
 
     private void waitForVncReady(String vncUrl, Duration timeout) {
@@ -515,7 +760,7 @@ public class BrowserContainerService {
                     }
                 }
             } catch (Exception ignore) {}
-            try { Thread.sleep(1000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+            sleep(1000);
         }
         log.warn("VNC did not become ready: {}", vncUrl);
     }
@@ -524,14 +769,25 @@ public class BrowserContainerService {
         long deadline = System.nanoTime() + timeout.toNanos();
         while (System.nanoTime() < deadline) {
             try {
-                HttpURLConnection conn = (HttpURLConnection) new URL(devToolsUrl + "/json").openConnection();
-                conn.setConnectTimeout(1000);
-                conn.setReadTimeout(1000);
+                HttpURLConnection conn = (HttpURLConnection) new URL(devToolsUrl + "/json/version").openConnection();
+                conn.setConnectTimeout(1200);
+                conn.setReadTimeout(1200);
                 conn.setRequestMethod("GET");
-                if (conn.getResponseCode() == 200) return;
+                int code = conn.getResponseCode();
+                if (code == 200) {
+                    try (InputStream is = conn.getInputStream()) {
+                        byte[] data = is.readAllBytes();
+                        if (data != null && data.length > 10) {
+                            // грубая проверка “похоже на JSON”
+                            String s = new String(data, StandardCharsets.UTF_8);
+                            if (s.contains("\"Browser\"") || s.contains("webSocketDebuggerUrl")) return;
+                        }
+                    }
+                }
             } catch (Exception ignore) {}
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+            sleep(500);
         }
+        log.warn("DevTools did not become ready: {}", devToolsUrl);
     }
 
     private void ensureDirectoryExists(String path) {
@@ -552,11 +808,12 @@ public class BrowserContainerService {
         return os.contains("win") ? path.replace('/', '\\') : path.replace('\\', '/');
     }
 
-    private void monitorFingerprintAfterStart(Profile profile) {
+    private void monitorFingerprintAfterStart(Long profileId) {
         CompletableFuture.runAsync(() -> {
             try {
-                Thread.sleep(10000);
-                fingerprintMonitor.monitorProfile(profile);
+                Thread.sleep(10_000);
+                Profile p = profileRepository.findById(profileId).orElse(null);
+                if (p != null) fingerprintMonitor.monitorProfile(p);
             } catch (Exception ignore) {}
         }, executorService);
     }
@@ -570,6 +827,34 @@ public class BrowserContainerService {
         });
     }
 
+    private void updateProfileChromeMajor(Long profileId, int major) {
+        profileRepository.findById(profileId).ifPresent(p -> {
+            try {
+                p.setChromeVersion(String.valueOf(major));
+                p.setFingerprintUpdatedAt(Instant.now());
+                profileRepository.save(p);
+            } catch (Exception ignore) {}
+        });
+    }
+
+    private void maybeSyncAndroidUaMajor(Long profileId, int major) {
+        profileRepository.findById(profileId).ifPresent(p -> {
+            String ua = p.getUserAgent();
+            if (ua == null) return;
+
+            if (!ua.contains("Android")) return;
+            if (!ua.contains("Chrome/")) return;
+
+            String updated = ua.replaceAll("Chrome/\\d+\\.\\d+\\.\\d+\\.\\d+", "Chrome/" + major + ".0.0.0");
+            if (!updated.equals(ua)) {
+                p.setUserAgent(updated);
+                p.setFingerprintUpdatedAt(Instant.now());
+                profileRepository.save(p);
+                log.info("Synced Android UA Chrome major to {} for profile={}", major, profileId);
+            }
+        });
+    }
+
     private boolean waitStoppedById(String containerId, int seconds) {
         long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(seconds);
         while (System.currentTimeMillis() < deadline) {
@@ -580,12 +865,12 @@ public class BrowserContainerService {
             } catch (com.github.dockerjava.api.exception.NotFoundException e) {
                 return true;
             } catch (Exception ignore) {}
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return false; }
+            sleep(500);
         }
         return false;
     }
 
-    private com.github.dockerjava.api.command.InspectContainerResponse inspectContainerQuiet(String nameOrId) {
+    private InspectContainerResponse inspectContainerQuiet(String nameOrId) {
         try {
             return dockerClient.inspectContainerCmd(nameOrId).exec();
         } catch (com.github.dockerjava.api.exception.NotFoundException e) {
@@ -594,35 +879,6 @@ public class BrowserContainerService {
             return null;
         }
     }
-
-    @PreDestroy
-    public void shutdown() {
-        executorService.shutdownNow();
-    }
-
-    public boolean isBrowserRunning(Long profileId) {
-        ContainerInfo info = ACTIVE_CONTAINERS.get(profileId);
-        if (info == null) return false;
-
-        // Надёжно: проверим реальное состояние контейнера
-        var inspected = inspectContainerQuiet(info.getContainerId());
-        boolean running = inspected != null
-                && inspected.getState() != null
-                && Boolean.TRUE.equals(inspected.getState().getRunning());
-
-        if (!running) {
-            ACTIVE_CONTAINERS.remove(profileId);
-        }
-        return running;
-    }
-
-    public Optional<ContainerInfo> getContainerInfo(Long profileId) {
-        return Optional.ofNullable(ACTIVE_CONTAINERS.get(profileId));
-    }
-
-    // ================== ВАЖНО: ЭТИ МЕТОДЫ У ТЕБЯ УЖЕ ЕСТЬ — ОСТАВЬ СВОИ РЕАЛИЗАЦИИ ==================
-
-
 
     private void cleanupOldContainerGracefully(String containerName) {
         var inspected = inspectContainerQuiet(containerName);
@@ -649,108 +905,51 @@ public class BrowserContainerService {
         }
     }
 
-    /**
-     * Подготавливает environment variables для контейнера
-     * (оставил твою логику — без изменений по смыслу)
-     */
-    private List<String> prepareEnvironmentVars(Profile profile, String proxyOverride) {
-        List<String> envVars = new ArrayList<>();
+    public boolean isBrowserRunning(Long profileId) {
+        ContainerInfo info = ACTIVE_CONTAINERS.get(profileId);
+        if (info == null) return false;
 
-        envVars.add("USER_DATA_DIR=/data/user-data");
-        envVars.add("PROFILE_ID=" + profile.getId());
-        envVars.add("EXTERNAL_KEY=" + profile.getExternalKey());
-        envVars.add("PROFILE_NAME=" + (profile.getName() != null ? profile.getName() : ""));
+        var inspected = inspectContainerQuiet(info.getContainerId());
+        boolean running = inspected != null
+                && inspected.getState() != null
+                && Boolean.TRUE.equals(inspected.getState().getRunning());
 
-        envVars.add("USER_AGENT=" + (profile.getUserAgent() != null ? profile.getUserAgent() : ""));
-        envVars.add("SCREEN_WIDTH=" + (profile.getScreenWidth() != null ? profile.getScreenWidth() : 1920));
-        envVars.add("SCREEN_HEIGHT=" + (profile.getScreenHeight() != null ? profile.getScreenHeight() : 1080));
-
-        if (profile.getPixelRatio() != null) envVars.add("PIXEL_RATIO=" + profile.getPixelRatio());
-        if (profile.getPlatform() != null) envVars.add("PLATFORM=" + profile.getPlatform());
-
-        if (profile.getHardwareConcurrency() != null) envVars.add("HARDWARE_CONCURRENCY=" + profile.getHardwareConcurrency());
-        if (profile.getDeviceMemory() != null) envVars.add("DEVICE_MEMORY=" + profile.getDeviceMemory());
-        if (profile.getMaxTouchPoints() != null) envVars.add("MAX_TOUCH_POINTS=" + profile.getMaxTouchPoints());
-
-        if (profile.getWebglVendor() != null) envVars.add("WEBGL_VENDOR=" + profile.getWebglVendor());
-        if (profile.getWebglRenderer() != null) envVars.add("WEBGL_RENDERER=" + profile.getWebglRenderer());
-        if (profile.getWebglVersion() != null) envVars.add("WEBGL_VERSION=" + profile.getWebglVersion());
-
-        if (profile.getTimezone() != null) envVars.add("TIMEZONE=" + profile.getTimezone());
-        if (profile.getLocale() != null) envVars.add("LOCALE=" + profile.getLocale());
-        if (profile.getLanguage() != null) envVars.add("LANGUAGE=" + profile.getLanguage());
-        if (profile.getTimezoneOffset() != null) envVars.add("TZ_OFFSET=" + profile.getTimezoneOffset());
-
-        if (profile.getScreenAvailWidth() != null) envVars.add("SCREEN_AVAIL_WIDTH=" + profile.getScreenAvailWidth());
-        if (profile.getScreenAvailHeight() != null) envVars.add("SCREEN_AVAIL_HEIGHT=" + profile.getScreenAvailHeight());
-        if (profile.getScreenColorDepth() != null) envVars.add("SCREEN_COLOR_DEPTH=" + profile.getScreenColorDepth());
-        if (profile.getScreenPixelDepth() != null) envVars.add("SCREEN_PIXEL_DEPTH=" + profile.getScreenPixelDepth());
-
-        if (profile.getCookieEnabled() != null) envVars.add("COOKIE_ENABLED=" + profile.getCookieEnabled());
-        if (profile.getDoNotTrack() != null) envVars.add("DO_NOT_TRACK=" + profile.getDoNotTrack());
-        if (profile.getOnline() != null) envVars.add("ONLINE=" + profile.getOnline());
-
-        if (profile.getChromeVersion() != null) envVars.add("CHROME_VERSION=" + profile.getChromeVersion());
-        if (profile.getOsVersion() != null) envVars.add("OS_VERSION=" + profile.getOsVersion());
-        if (profile.getOsArchitecture() != null) envVars.add("OS_ARCH=" + profile.getOsArchitecture());
-
-        if (profile.getAudioSampleRate() != null) envVars.add("AUDIO_SAMPLE_RATE=" + profile.getAudioSampleRate());
-        if (profile.getAudioChannelCount() != null) envVars.add("AUDIO_CHANNEL_COUNT=" + profile.getAudioChannelCount());
-        if (profile.getAudioContextLatency() != null) envVars.add("AUDIO_CONTEXT_LATENCY=" + profile.getAudioContextLatency());
-
-        if (profile.getBatteryCharging() != null) envVars.add("BATTERY_CHARGING=" + profile.getBatteryCharging());
-        if (profile.getBatteryLevel() != null) envVars.add("BATTERY_LEVEL=" + profile.getBatteryLevel());
-        if (profile.getBatteryChargingTime() != null) envVars.add("BATTERY_CHARGING_TIME=" + profile.getBatteryChargingTime());
-        if (profile.getBatteryDischargingTime() != null) envVars.add("BATTERY_DISCHARGING_TIME=" + profile.getBatteryDischargingTime());
-
-        if (profile.getConnectionDownlink() != null) envVars.add("CONNECTION_DOWNLINK=" + profile.getConnectionDownlink());
-        if (profile.getConnectionEffectiveType() != null) envVars.add("CONNECTION_EFFECTIVE_TYPE=" + profile.getConnectionEffectiveType());
-        if (profile.getConnectionRtt() != null) envVars.add("CONNECTION_RTT=" + profile.getConnectionRtt());
-        if (profile.getConnectionSaveData() != null) envVars.add("CONNECTION_SAVE_DATA=" + profile.getConnectionSaveData());
-        if (profile.getConnectionType() != null) envVars.add("CONNECTION_TYPE=" + profile.getConnectionType());
-
-        if (profile.getMouseMovementVariance() != null) envVars.add("MOUSE_VARIANCE=" + profile.getMouseMovementVariance());
-        if (profile.getTypingSpeed() != null) envVars.add("TYPING_SPEED=" + profile.getTypingSpeed());
-        if (profile.getScrollSpeed() != null) envVars.add("SCROLL_SPEED=" + profile.getScrollSpeed());
-
-        String proxyToUse = resolveProxy(proxyOverride, profile.getProxyUrl());
-        if (proxyToUse != null && !proxyToUse.trim().isEmpty()) {
-            envVars.add("PROXY_URL=" + proxyToUse);
-        }
-
-        envVars.add("DETECTION_LEVEL=" + (profile.getDetectionLevel() != null ? profile.getDetectionLevel() : "ENHANCED"));
-        envVars.add("ENABLE_VNC=true");
-
-        if (profile.getCanvasFingerprint() != null) envVars.add("CANVAS_FINGERPRINT=" + profile.getCanvasFingerprint());
-        if (profile.getCanvasNoiseHash() != null) envVars.add("CANVAS_NOISE_HASH=" + profile.getCanvasNoiseHash());
-
-        // JSON поля (как у тебя было)
-        if (profile.getWebglExtensionsJson() != null && !profile.getWebglExtensionsJson().isEmpty() && !"null".equals(profile.getWebglExtensionsJson())) {
-            envVars.add("WEBGL_EXTENSIONS_JSON=" + profile.getWebglExtensionsJson());
-        }
-        if (profile.getPluginsJson() != null && !profile.getPluginsJson().isEmpty() && !"null".equals(profile.getPluginsJson())) {
-            envVars.add("PLUGINS_JSON=" + profile.getPluginsJson());
-        }
-        if (profile.getFontsListJson() != null && !profile.getFontsListJson().isEmpty() && !"null".equals(profile.getFontsListJson())) {
-            envVars.add("FONTS_LIST_JSON=" + profile.getFontsListJson());
-        }
-        if (profile.getMediaDevicesJson() != null && !profile.getMediaDevicesJson().isEmpty() && !"null".equals(profile.getMediaDevicesJson())) {
-            envVars.add("MEDIA_DEVICES_JSON=" + profile.getMediaDevicesJson());
-        }
-        if (profile.getBatteryInfoJson() != null && !profile.getBatteryInfoJson().isEmpty() && !"null".equals(profile.getBatteryInfoJson())) {
-            envVars.add("BATTERY_INFO_JSON=" + profile.getBatteryInfoJson());
-        }
-        if (profile.getConnectionInfoJson() != null && !profile.getConnectionInfoJson().isEmpty() && !"null".equals(profile.getConnectionInfoJson())) {
-            envVars.add("CONNECTION_INFO_JSON=" + profile.getConnectionInfoJson());
-        }
-        if (profile.getAudioFingerprintJson() != null && !profile.getAudioFingerprintJson().isEmpty() && !"null".equals(profile.getAudioFingerprintJson())) {
-            envVars.add("AUDIO_FINGERPRINT_JSON=" + profile.getAudioFingerprintJson());
-        }
-
-        return envVars;
+        if (!running) ACTIVE_CONTAINERS.remove(profileId);
+        return running;
     }
 
+    public Optional<ContainerInfo> getContainerInfo(Long profileId) {
+        return Optional.ofNullable(ACTIVE_CONTAINERS.get(profileId));
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        executorService.shutdownNow();
+    }
+
+    private void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    // -------------------- DTO --------------------
+
+    private static final class DevtoolsVersion {
+        final String browser;
+        final String userAgent;
+        final int major;
+
+        DevtoolsVersion(String browser, String userAgent, int major) {
+            this.browser = browser;
+            this.userAgent = userAgent;
+            this.major = major;
+        }
+    }
 }
+
+
+
+
+
 
 
 

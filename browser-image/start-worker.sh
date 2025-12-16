@@ -1,46 +1,3 @@
-FROM debian:12-slim
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    DISPLAY=:0 \
-    LANG=en_US.UTF-8 \
-    LC_ALL=en_US.UTF-8 \
-    TZ=Europe/Moscow
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl wget gnupg tzdata locales \
-    xvfb x11vnc fluxbox xauth x11-utils \
-    novnc websockify \
-    chromium \
-    dbus dbus-x11 \
-    xdotool wmctrl \
-    sqlite3 \
-    fonts-liberation fonts-noto fonts-noto-cjk fonts-noto-color-emoji \
-    procps jq socat tini \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN sed -i 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
-    locale-gen
-
-# Ensure machine-id exists & stable inside the container filesystem
-RUN dbus-uuidgen --ensure=/etc/machine-id
-
-RUN mkdir -p /data/user-data /scripts /tmp/.X11-unix /run/dbus && \
-    chmod 1777 /tmp/.X11-unix
-
-COPY start.sh /scripts/start.sh
-RUN chmod +x /scripts/start.sh
-
-WORKDIR /scripts
-EXPOSE 6080 9222 9223
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:6080/ >/dev/null || exit 1
-
-ENTRYPOINT ["/usr/bin/tini","--"]
-CMD ["/scripts/start.sh"]
-
-
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -64,9 +21,9 @@ USER_DATA_DIR="${USER_DATA_DIR:-/data/user-data}"
 LANGUAGE_SAFE="${LANGUAGE:-en-US}"
 TZ_SAFE="${TIMEZONE:-${TZ:-}}"
 
-DEVTOOLS_PORT="${DEVTOOLS_PORT:-9222}"
-DEVTOOLS_PROXY_PORT="${DEVTOOLS_PROXY_PORT:-9223}"
+DEVTOOLS_PORT="${DEVTOOLS_PORT:-9223}"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
+
 
 CHROMIUM_BIN="${CHROMIUM_BIN:-$(command -v chromium || true)}"
 if [[ -z "${CHROMIUM_BIN}" ]]; then
@@ -152,7 +109,7 @@ cleanup() {
   sync || true
   sleep 2
 
-  pkill -TERM -f "socat TCP-LISTEN:${DEVTOOLS_PROXY_PORT}" 2>/dev/null || true
+#  pkill -TERM -f "socat TCP-LISTEN:${DEVTOOLS_PROXY_PORT}" 2>/dev/null || true
   pkill -TERM -f "novnc_proxy|websockify" 2>/dev/null || true
   pkill -TERM -f "x11vnc" 2>/dev/null || true
   pkill -TERM -f "fluxbox" 2>/dev/null || true
@@ -281,9 +238,11 @@ CHROME_ARGS=(
   "--no-default-browser-check"
   "--disable-dev-shm-usage"
   "--disable-session-crashed-bubble"
-  "--remote-debugging-address=127.0.0.1"
+
+  "--remote-debugging-address=0.0.0.0"
   "--remote-debugging-port=${DEVTOOLS_PORT}"
   "--remote-allow-origins=*"
+
   "--password-store=basic"
   "--use-mock-keychain"
   "--no-sandbox"
@@ -318,8 +277,8 @@ for i in $(seq 1 60); do
   sleep 1
 done
 
-log "Starting DevTools proxy :${DEVTOOLS_PROXY_PORT} -> :${DEVTOOLS_PORT}"
-socat "TCP-LISTEN:${DEVTOOLS_PROXY_PORT},fork,reuseaddr" "TCP:127.0.0.1:${DEVTOOLS_PORT}" >/tmp/socat.log 2>&1 &
+#log "Starting DevTools proxy :${DEVTOOLS_PROXY_PORT} -> :${DEVTOOLS_PORT}"
+#socat "TCP-LISTEN:${DEVTOOLS_PROXY_PORT},fork,reuseaddr" "TCP:127.0.0.1:${DEVTOOLS_PORT}" >/tmp/socat.log 2>&1 &
 
 # =============================
 # FIX geometry
@@ -348,7 +307,7 @@ fi
 log "=== STARTUP COMPLETE ==="
 log "noVNC:    http://localhost:${NOVNC_PORT}/vnc.html"
 log "DevTools: http://localhost:${DEVTOOLS_PORT}"
-log "Proxy:    http://localhost:${DEVTOOLS_PROXY_PORT}"
+#log "Proxy:    http://localhost:${DEVTOOLS_PROXY_PORT}"
 log "Profile:  ${USER_DATA_DIR}"
 log "Xvfb:     ${SCREEN_GEOMETRY}"
 log "Note:     DPR is handled by DevTools emulation (PIXEL_RATIO=${PIXEL_RATIO})"

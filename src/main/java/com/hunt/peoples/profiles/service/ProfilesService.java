@@ -16,14 +16,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.*;
-import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.regex.Pattern;
-import java.util.regex.Matcher;
+
 import java.util.stream.Stream;
 
 @Slf4j
@@ -135,6 +131,66 @@ public class ProfilesService {
     /**
      * Создает профиль с рандомными мобильными параметрами
      */
+    private void setRandomMobileParameters(Profile profile, boolean isMobile) {
+        if (!isMobile) return;
+
+        Random random = new Random();
+
+        // 1) language / locale
+        String[] mobileLanguages = {"en-US", "ru-RU", "zh-CN", "es-ES", "fr-FR", "de-DE"};
+        String language = mobileLanguages[random.nextInt(mobileLanguages.length)];
+        profile.setLanguage(language);
+        profile.setLocale(language.replace("-", "_"));
+
+        // 2) timezone (и offset строго из timezone!)
+        String[] mobileTimezones = {
+                "Europe/Moscow", "America/New_York", "Europe/London",
+                "Asia/Tokyo", "Australia/Sydney", "Asia/Shanghai"
+        };
+        String tz = mobileTimezones[random.nextInt(mobileTimezones.length)];
+        profile.setTimezone(tz);
+        profile.setTimezoneOffset(computeTimezoneOffsetMinutes(tz));
+
+        // 3) экранные derived-поля (не “fingerprint ядро”, а derived)
+        if (profile.getScreenWidth() != null) {
+            profile.setScreenAvailWidth(Math.max(0, profile.getScreenWidth() - (10 + random.nextInt(25))));
+        }
+        if (profile.getScreenHeight() != null) {
+            profile.setScreenAvailHeight(Math.max(0, profile.getScreenHeight() - (40 + random.nextInt(120))));
+        }
+        profile.setScreenColorDepth(24);
+        profile.setScreenPixelDepth(24);
+
+        // 4) базовое поведение
+        profile.setCookieEnabled(true);
+        profile.setDoNotTrack("unspecified");
+        profile.setOnline(true);
+
+        profile.setMouseMovementVariance(0.1 + random.nextDouble() * 0.3);
+        profile.setTypingSpeed(30 + random.nextInt(40));
+        profile.setScrollSpeed(50 + random.nextDouble() * 100);
+
+        // 5) версии НЕ хардкодим тут вообще
+        // chrome/os версии пусть идут:
+        // - из FingerprintGenerator (по UA) при создании
+        // - и/или из BrowserContainerService (реальный major) после старта
+    }
+    private int computeTimezoneOffsetMinutes(String timezoneId) {
+        try {
+            ZoneId zone = ZoneId.of(timezoneId);
+            ZoneOffset offset = zone.getRules().getOffset(Instant.now());
+            // JS getTimezoneOffset() = UTC - LOCAL (в минутах)
+            // ZoneOffset.getTotalSeconds() = LOCAL - UTC (в секундах)
+            // => timezoneOffsetMinutes = -(LOCAL-UTC) = UTC-LOCAL
+            return -(offset.getTotalSeconds() / 60);
+        } catch (Exception e) {
+            return -180; // fallback (Europe/Moscow как раньше)
+        }
+    }
+
+
+
+
     private Profile createProfileWithRandomMobileParams(String externalKey, String proxyUrl,
                                                         String deviceType, String detectionLevel) {
         log.info("Creating profile with random mobile params: key={}, deviceType={}, level={}",
@@ -427,156 +483,156 @@ public class ProfilesService {
     /**
      * Устанавливает рандомные мобильные параметры для профиля
      */
-    private void setRandomMobileParameters(Profile profile, boolean isMobile) {
-        Random random = new Random();
-
-        if (isMobile) {
-            // Мобильные параметры
-            profile.setScreenAvailWidth(profile.getScreenWidth() - 20);
-            profile.setScreenAvailHeight(profile.getScreenHeight() - 80);
-            profile.setScreenColorDepth(24);
-            profile.setScreenPixelDepth(24);
-            profile.setTimezoneOffset(random.nextInt(13) * 60 - 720); // -12 to +12 hours
-            profile.setCookieEnabled(true);
-            profile.setDoNotTrack("unspecified");
-            profile.setOnline(true);
-
-            // Устанавливаем язык и локаль
-            String[] mobileLanguages = {"en-US", "ru-RU", "zh-CN", "es-ES", "fr-FR", "de-DE"};
-            String language = mobileLanguages[random.nextInt(mobileLanguages.length)];
-            profile.setLanguage(language);
-            profile.setLocale(language.replace("-", "_"));
-
-            // Устанавливаем часовой пояс
-            String[] mobileTimezones = {
-                    "Europe/Moscow", "America/New_York", "Europe/London",
-                    "Asia/Tokyo", "Australia/Sydney", "Asia/Shanghai"
-            };
-            profile.setTimezone(mobileTimezones[random.nextInt(mobileTimezones.length)]);
-
-            // Устанавливаем версии
-            profile.setChromeVersion("120.0.0.0");
-            profile.setOsVersion(isIosDevice(profile.getUserAgent()) ? "16.0" : "13.0");
-            profile.setOsArchitecture("arm64");
-
-            // Устанавливаем аудио параметры
-            profile.setAudioSampleRate(48000);
-            profile.setAudioChannelCount("stereo");
-            profile.setAudioContextLatency(0.005 + random.nextDouble() * 0.001);
-
-            // Устанавливаем параметры батареи для мобильных
-            Map<String, Object> batteryInfo = new HashMap<>();
-            batteryInfo.put("charging", random.nextBoolean());
-            batteryInfo.put("chargingTime", random.nextBoolean() ? 1800 : 0);
-            batteryInfo.put("dischargingTime", 7200 + random.nextInt(3600));
-            batteryInfo.put("level", 0.3 + random.nextDouble() * 0.6);
-            try {
-                profile.setBatteryInfoJson(objectMapper.writeValueAsString(batteryInfo));
-            } catch (Exception e) {
-                log.warn("Failed to serialize battery info", e);
-            }
-
-            // Устанавливаем параметры соединения
-            Map<String, Object> connectionInfo = new HashMap<>();
-            String[] connectionTypes = {"wifi", "cellular", "bluetooth", "ethernet"};
-            String[] effectiveTypes = {"4g", "3g", "2g"};
-            connectionInfo.put("downlink", 5.0 + random.nextDouble() * 10.0);
-            connectionInfo.put("effectiveType", effectiveTypes[random.nextInt(effectiveTypes.length)]);
-            connectionInfo.put("rtt", 50 + random.nextInt(150));
-            connectionInfo.put("saveData", random.nextBoolean());
-            connectionInfo.put("type", connectionTypes[random.nextInt(connectionTypes.length)]);
-            try {
-                profile.setConnectionInfoJson(objectMapper.writeValueAsString(connectionInfo));
-            } catch (Exception e) {
-                log.warn("Failed to serialize connection info", e);
-            }
-
-            // Устанавливаем поведенческие параметры для мобильных
-            profile.setMouseMovementVariance(0.1 + random.nextDouble() * 0.3);
-            profile.setTypingSpeed(30 + random.nextInt(40));
-            profile.setScrollSpeed(50 + random.nextDouble() * 100);
-
-            // Устанавливаем WebGL extensions
-            Map<String, Object> webglExtensions = new HashMap<>();
-            webglExtensions.put("EXT_blend_minmax", true);
-            webglExtensions.put("WEBGL_compressed_texture_s3tc", true);
-            webglExtensions.put("WEBGL_debug_renderer_info", false); // Скрываем для безопасности
-            try {
-                profile.setWebglExtensionsJson(objectMapper.writeValueAsString(webglExtensions));
-            } catch (Exception e) {
-                log.warn("Failed to serialize WebGL extensions", e);
-            }
-
-            // Устанавливаем плагины для мобильных
-            List<Map<String, Object>> plugins = new ArrayList<>();
-            Map<String, Object> plugin = new HashMap<>();
-            plugin.put("name", "PDF Viewer");
-            plugin.put("filename", "internal-pdf-viewer");
-            plugin.put("description", "Portable Document Format");
-            plugin.put("length", 1);
-            plugins.add(plugin);
-            try {
-                profile.setPluginsJson(objectMapper.writeValueAsString(plugins));
-            } catch (Exception e) {
-                log.warn("Failed to serialize plugins", e);
-            }
-
-            // Устанавливаем медиа устройства
-            List<Map<String, Object>> mediaDevices = new ArrayList<>();
-            String[] deviceKinds = {"audioinput", "audiooutput", "videoinput"};
-            for (String kind : deviceKinds) {
-                Map<String, Object> device = new HashMap<>();
-                device.put("deviceId", "default");
-                device.put("groupId", "default-group");
-                device.put("kind", kind);
-                device.put("label", "");
-                mediaDevices.add(device);
-            }
-            try {
-                profile.setMediaDevicesJson(objectMapper.writeValueAsString(mediaDevices));
-            } catch (Exception e) {
-                log.warn("Failed to serialize media devices", e);
-            }
-
-            // Устанавливаем шрифты для мобильных
-            List<String> fonts = Arrays.asList(
-                    "Arial", "Helvetica", "Times New Roman", "Courier New",
-                    "Verdana", "Georgia", "Palatino", "Garamond",
-                    "Bookman", "Comic Sans MS", "Trebuchet MS", "Arial Black",
-                    "Impact", "Tahoma", "Courier", "Lucida Console"
-            );
-            try {
-                profile.setFontsListJson(objectMapper.writeValueAsString(fonts));
-            } catch (Exception e) {
-                log.warn("Failed to serialize fonts", e);
-            }
-
-            // Устанавливаем информацию навигатора
-            Map<String, Object> navigatorInfo = new HashMap<>();
-            navigatorInfo.put("cookieEnabled", true);
-            navigatorInfo.put("doNotTrack", "unspecified");
-            navigatorInfo.put("online", true);
-            try {
-                profile.setNavigatorInfoJson(objectMapper.writeValueAsString(navigatorInfo));
-            } catch (Exception e) {
-                log.warn("Failed to serialize navigator info", e);
-            }
-
-            // Устанавливаем список сайтов
-            List<String> websites = Arrays.asList(
-                    "https://google.com",
-                    "https://youtube.com",
-                    "https://facebook.com",
-                    "https://amazon.com",
-                    "https://twitter.com"
-            );
-            try {
-                profile.setCommonWebsitesJson(objectMapper.writeValueAsString(websites));
-            } catch (Exception e) {
-                log.warn("Failed to serialize websites", e);
-            }
-        }
-    }
+//    private void setRandomMobileParameters(Profile profile, boolean isMobile) {
+//        Random random = new Random();
+//
+//        if (isMobile) {
+//            // Мобильные параметры
+//            profile.setScreenAvailWidth(profile.getScreenWidth() - 20);
+//            profile.setScreenAvailHeight(profile.getScreenHeight() - 80);
+//            profile.setScreenColorDepth(24);
+//            profile.setScreenPixelDepth(24);
+//            profile.setTimezoneOffset(random.nextInt(13) * 60 - 720); // -12 to +12 hours
+//            profile.setCookieEnabled(true);
+//            profile.setDoNotTrack("unspecified");
+//            profile.setOnline(true);
+//
+//            // Устанавливаем язык и локаль
+//            String[] mobileLanguages = {"en-US", "ru-RU", "zh-CN", "es-ES", "fr-FR", "de-DE"};
+//            String language = mobileLanguages[random.nextInt(mobileLanguages.length)];
+//            profile.setLanguage(language);
+//            profile.setLocale(language.replace("-", "_"));
+//
+//            // Устанавливаем часовой пояс
+//            String[] mobileTimezones = {
+//                    "Europe/Moscow", "America/New_York", "Europe/London",
+//                    "Asia/Tokyo", "Australia/Sydney", "Asia/Shanghai"
+//            };
+//            profile.setTimezone(mobileTimezones[random.nextInt(mobileTimezones.length)]);
+//
+//            // Устанавливаем версии
+//            profile.setChromeVersion("120.0.0.0");
+//            profile.setOsVersion(isIosDevice(profile.getUserAgent()) ? "16.0" : "13.0");
+//            profile.setOsArchitecture("arm64");
+//
+//            // Устанавливаем аудио параметры
+//            profile.setAudioSampleRate(48000);
+//            profile.setAudioChannelCount("stereo");
+//            profile.setAudioContextLatency(0.005 + random.nextDouble() * 0.001);
+//
+//            // Устанавливаем параметры батареи для мобильных
+//            Map<String, Object> batteryInfo = new HashMap<>();
+//            batteryInfo.put("charging", random.nextBoolean());
+//            batteryInfo.put("chargingTime", random.nextBoolean() ? 1800 : 0);
+//            batteryInfo.put("dischargingTime", 7200 + random.nextInt(3600));
+//            batteryInfo.put("level", 0.3 + random.nextDouble() * 0.6);
+//            try {
+//                profile.setBatteryInfoJson(objectMapper.writeValueAsString(batteryInfo));
+//            } catch (Exception e) {
+//                log.warn("Failed to serialize battery info", e);
+//            }
+//
+//            // Устанавливаем параметры соединения
+//            Map<String, Object> connectionInfo = new HashMap<>();
+//            String[] connectionTypes = {"wifi", "cellular", "bluetooth", "ethernet"};
+//            String[] effectiveTypes = {"4g", "3g", "2g"};
+//            connectionInfo.put("downlink", 5.0 + random.nextDouble() * 10.0);
+//            connectionInfo.put("effectiveType", effectiveTypes[random.nextInt(effectiveTypes.length)]);
+//            connectionInfo.put("rtt", 50 + random.nextInt(150));
+//            connectionInfo.put("saveData", random.nextBoolean());
+//            connectionInfo.put("type", connectionTypes[random.nextInt(connectionTypes.length)]);
+//            try {
+//                profile.setConnectionInfoJson(objectMapper.writeValueAsString(connectionInfo));
+//            } catch (Exception e) {
+//                log.warn("Failed to serialize connection info", e);
+//            }
+//
+//            // Устанавливаем поведенческие параметры для мобильных
+//            profile.setMouseMovementVariance(0.1 + random.nextDouble() * 0.3);
+//            profile.setTypingSpeed(30 + random.nextInt(40));
+//            profile.setScrollSpeed(50 + random.nextDouble() * 100);
+//
+//            // Устанавливаем WebGL extensions
+//            Map<String, Object> webglExtensions = new HashMap<>();
+//            webglExtensions.put("EXT_blend_minmax", true);
+//            webglExtensions.put("WEBGL_compressed_texture_s3tc", true);
+//            webglExtensions.put("WEBGL_debug_renderer_info", false); // Скрываем для безопасности
+//            try {
+//                profile.setWebglExtensionsJson(objectMapper.writeValueAsString(webglExtensions));
+//            } catch (Exception e) {
+//                log.warn("Failed to serialize WebGL extensions", e);
+//            }
+//
+//            // Устанавливаем плагины для мобильных
+//            List<Map<String, Object>> plugins = new ArrayList<>();
+//            Map<String, Object> plugin = new HashMap<>();
+//            plugin.put("name", "PDF Viewer");
+//            plugin.put("filename", "internal-pdf-viewer");
+//            plugin.put("description", "Portable Document Format");
+//            plugin.put("length", 1);
+//            plugins.add(plugin);
+//            try {
+//                profile.setPluginsJson(objectMapper.writeValueAsString(plugins));
+//            } catch (Exception e) {
+//                log.warn("Failed to serialize plugins", e);
+//            }
+//
+//            // Устанавливаем медиа устройства
+//            List<Map<String, Object>> mediaDevices = new ArrayList<>();
+//            String[] deviceKinds = {"audioinput", "audiooutput", "videoinput"};
+//            for (String kind : deviceKinds) {
+//                Map<String, Object> device = new HashMap<>();
+//                device.put("deviceId", "default");
+//                device.put("groupId", "default-group");
+//                device.put("kind", kind);
+//                device.put("label", "");
+//                mediaDevices.add(device);
+//            }
+//            try {
+//                profile.setMediaDevicesJson(objectMapper.writeValueAsString(mediaDevices));
+//            } catch (Exception e) {
+//                log.warn("Failed to serialize media devices", e);
+//            }
+//
+//            // Устанавливаем шрифты для мобильных
+//            List<String> fonts = Arrays.asList(
+//                    "Arial", "Helvetica", "Times New Roman", "Courier New",
+//                    "Verdana", "Georgia", "Palatino", "Garamond",
+//                    "Bookman", "Comic Sans MS", "Trebuchet MS", "Arial Black",
+//                    "Impact", "Tahoma", "Courier", "Lucida Console"
+//            );
+//            try {
+//                profile.setFontsListJson(objectMapper.writeValueAsString(fonts));
+//            } catch (Exception e) {
+//                log.warn("Failed to serialize fonts", e);
+//            }
+//
+//            // Устанавливаем информацию навигатора
+//            Map<String, Object> navigatorInfo = new HashMap<>();
+//            navigatorInfo.put("cookieEnabled", true);
+//            navigatorInfo.put("doNotTrack", "unspecified");
+//            navigatorInfo.put("online", true);
+//            try {
+//                profile.setNavigatorInfoJson(objectMapper.writeValueAsString(navigatorInfo));
+//            } catch (Exception e) {
+//                log.warn("Failed to serialize navigator info", e);
+//            }
+//
+//            // Устанавливаем список сайтов
+//            List<String> websites = Arrays.asList(
+//                    "https://google.com",
+//                    "https://youtube.com",
+//                    "https://facebook.com",
+//                    "https://amazon.com",
+//                    "https://twitter.com"
+//            );
+//            try {
+//                profile.setCommonWebsitesJson(objectMapper.writeValueAsString(websites));
+//            } catch (Exception e) {
+//                log.warn("Failed to serialize websites", e);
+//            }
+//        }
+//    }
 
     /**
      * Создает директорию профиля
