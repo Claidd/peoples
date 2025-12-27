@@ -616,34 +616,34 @@ public class ProfileController {
         }
     }
 
-    @GetMapping("/available-devices")
-    @Operation(summary = "Получить список доступных типов устройств")
-    public ResponseEntity<List<DeviceTypeInfo>> getAvailableDeviceTypes() {
-        List<DeviceTypeInfo> devices = fingerprintGenerator.getAvailableDeviceTypes().stream()
-                .map(type -> {
-                    var template = fingerprintGenerator.getDeviceProfileTemplate(type).orElse(null);
-                    return DeviceTypeInfo.builder()
-                            .id(type)
-                            .name(getDeviceDisplayName(type))
-                            .platform(template != null ? template.getPlatform() : "Unknown")
-                            .screenSize(template != null ?
-                                    template.getWidth() + "x" + template.getHeight() : "Unknown")
-                            .pixelRatio(template != null ? template.getPixelRatio() : null)
-                            .isMobile(template != null && template.isMobile())
-                            .build();
-                })
-                .collect(Collectors.toList());
-
-        devices.add(DeviceTypeInfo.builder()
-                .id("random")
-                .name("Random Device")
-                .platform("Mixed")
-                .screenSize("Variable")
-                .isMobile(true)
-                .build());
-
-        return ResponseEntity.ok(devices);
-    }
+//    @GetMapping("/available-devices")
+//    @Operation(summary = "Получить список доступных типов устройств")
+//    public ResponseEntity<List<DeviceTypeInfo>> getAvailableDeviceTypes() {
+//        List<DeviceTypeInfo> devices = fingerprintGenerator.getAvailableDeviceTypes().stream()
+//                .map(type -> {
+//                    var template = fingerprintGenerator.getDeviceProfileTemplate(type).orElse(null);
+//                    return DeviceTypeInfo.builder()
+//                            .id(type)
+//                            .name(getDeviceDisplayName(type))
+//                            .platform(template != null ? template.getPlatform() : "Unknown")
+//                            .screenSize(template != null ?
+//                                    template.getWidth() + "x" + template.getHeight() : "Unknown")
+//                            .pixelRatio(template != null ? template.getPixelRatio() : null)
+//                            .isMobile(template != null && template.isMobile())
+//                            .build();
+//                })
+//                .collect(Collectors.toList());
+//
+//        devices.add(DeviceTypeInfo.builder()
+//                .id("random")
+//                .name("Random Device")
+//                .platform("Mixed")
+//                .screenSize("Variable")
+//                .isMobile(true)
+//                .build());
+//
+//        return ResponseEntity.ok(devices);
+//    }
 
     @GetMapping("/all-external-keys")
     @Operation(summary = "Получить все external keys")

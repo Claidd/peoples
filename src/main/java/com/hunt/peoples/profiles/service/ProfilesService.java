@@ -55,12 +55,20 @@ public class ProfilesService {
     );
 
     /**
-     * Основной метод для интеграции - создает или находит профиль по externalKey
+     * Получает случайный тип мобильного устройства
      */
-    @Transactional
-    public Profile findOrCreateProfileForIntegration(String externalKey, String proxyUrl) {
-        return findOrCreateByExternalKey(externalKey, proxyUrl, null, null, false);
+    private String getRandomMobileDeviceType() {
+        Random random = new Random();
+        return MOBILE_DEVICE_TYPES.get(random.nextInt(MOBILE_DEVICE_TYPES.size()));
     }
+
+    /**
+     * Получает отображаемое имя устройства
+     */
+    private String getDeviceDisplayName(String deviceType) {
+        return DEVICE_DISPLAY_NAMES.getOrDefault(deviceType, deviceType);
+    }
+
 
     /**
      * Поиск или создание профиля по externalKey
@@ -74,8 +82,9 @@ public class ProfilesService {
         log.info("Processing profile request: key={}, proxy={}, deviceType={}, level={}, forceNew={}",
                 safeKey, proxyUrl, deviceType, detectionLevel, forceNew);
 
-        // Если не forceNew, ищем существующий профиль
+        // Если нет запроса на новые данные userAgent forceNew?
         if (!forceNew) {
+            // Если нет, ищем существующий профиль
             Optional<Profile> existingProfile = profileRepository.findByExternalKey(safeKey);
             if (existingProfile.isPresent()) {
                 Profile profile = existingProfile.get();
@@ -90,10 +99,11 @@ public class ProfilesService {
                     log.info("Updated proxy for profile {}: {}", safeKey, proxyUrl);
                 }
 
-                // Проверяем, нуждается ли профиль в обновлении fingerprint
+                // Проверяем, нуждается ли профиль в обновлении fingerprint ? для этого профиля
                 if (profile.needsFingerprintUpdate()) {
                     log.info("Profile {} needs fingerprint update (last update: {})",
                             profile.getId(), profile.getFingerprintUpdatedAt());
+                    // Если да, то перезаписываем фингерпринт для профиля.
                     return updateFingerprintWithRandomMobile(profile);
                 }
 
@@ -112,11 +122,11 @@ public class ProfilesService {
         }
 
         // Если deviceType не указан, выбираем случайное мобильное устройство
-        String deviceTypeToUse = deviceType;
-        if (deviceTypeToUse == null || deviceTypeToUse.trim().isEmpty()) {
-            deviceTypeToUse = getRandomMobileDeviceType();
-            log.info("No deviceType specified, using random mobile device: {}", deviceTypeToUse);
-        }
+//        String deviceTypeToUse = deviceType;
+//        if (deviceTypeToUse == null || deviceTypeToUse.trim().isEmpty()) {
+//            deviceTypeToUse = getRandomMobileDeviceType();
+//            log.info("No deviceType specified, using random mobile device: {}", deviceTypeToUse);
+//        }
 
         // Если detectionLevel не указан, используем ENHANCED
         String detectionLevelToUse = detectionLevel;
@@ -125,8 +135,90 @@ public class ProfilesService {
         }
 
         // Создаем новый профиль с рандомными мобильными параметрами
-        return createProfileWithRandomMobileParams(safeKey, proxyUrl, deviceTypeToUse, detectionLevelToUse);
+//        return createProfileWithRandomMobileParams(safeKey, proxyUrl, deviceTypeToUse, detectionLevelToUse);
+        return fingerprintGenerator.generateCompleteProfile(safeKey, null, detectionLevelToUse, proxyUrl);
     }
+
+//    private Profile createProfileWithRandomMobileParams(String externalKey, String proxyUrl,
+//                                                        String deviceType, String detectionLevel) {
+//        log.info("Creating profile with random mobile params: key={}, deviceType={}, level={}",
+//                externalKey, deviceType, detectionLevel);
+//
+//        try {
+//            // 1. Генерируем DeviceProfile с помощью fingerprintGenerator
+//            DeviceProfile deviceProfile;
+//            if ("random".equalsIgnoreCase(deviceType)) {
+//                deviceProfile = fingerprintGenerator.generateRandomMobileProfile();
+//                log.info("Generated random mobile profile");
+//            } else {
+//                deviceProfile = fingerprintGenerator.generateDeviceProfile(deviceType, detectionLevel);
+//                log.info("Generated device profile for type: {}", deviceType);
+//            }
+//
+//            if (deviceProfile == null) {
+//                log.error("Failed to generate device profile for type: {}", deviceType);
+//                throw new RuntimeException("Failed to generate device profile");
+//            }
+//
+//            // 2. Создаем новый профиль и заполняем его данными
+//            Profile profile = new Profile();
+//            profile.setExternalKey(externalKey);
+//            profile.setName(getDeviceDisplayName(deviceType) + " - " + externalKey);
+//            profile.setDetectionLevel(detectionLevel);
+//            profile.setDetectionRisk(calculateRiskForDetectionLevel(detectionLevel));
+//
+//            // 3. Заполняем базовые поля из DeviceProfile
+//            profile.setUserAgent(deviceProfile.getUserAgent());
+//            profile.setScreenWidth(deviceProfile.getWidth());
+//            profile.setScreenHeight(deviceProfile.getHeight());
+//            profile.setPixelRatio(deviceProfile.getPixelRatio());
+//            profile.setPlatform(deviceProfile.getPlatform());
+//            profile.setHardwareConcurrency(deviceProfile.getHardwareConcurrency());
+//            profile.setDeviceMemory(deviceProfile.getDeviceMemory());
+//            profile.setMaxTouchPoints(deviceProfile.getMaxTouchPoints());
+//            profile.setWebglVendor(deviceProfile.getWebglVendor());
+//            profile.setWebglRenderer(deviceProfile.getWebglRenderer());
+//            profile.setWebglVersion(deviceProfile.getWebglVersion());
+//            profile.setAudioContextLatency(deviceProfile.getAudioContextLatency());
+//            profile.setCanvasFingerprint(deviceProfile.getCanvasFingerprint());
+//            profile.setCanvasNoiseHash(deviceProfile.getCanvasNoiseHash());
+//
+//            // 4. Устанавливаем DeviceProfile JSON
+//            try {
+//                profile.setDeviceProfileJson(objectMapper.writeValueAsString(deviceProfile));
+//            } catch (Exception e) {
+//                log.warn("Failed to serialize device profile to JSON", e);
+//            }
+//
+//            // 5. Устанавливаем рандомные мобильные параметры
+//            setRandomMobileParameters(profile, deviceProfile.isMobile());
+//
+//            // 6. Создаем директорию профиля
+//            String userDataPath = createProfileDirectory(externalKey);
+//            profile.setUserDataPath(userDataPath);
+//
+//            // 7. Устанавливаем остальные поля
+//            profile.setProxyUrl(proxyUrl);
+//            profile.setStatus("FREE");
+//            profile.setIsActive(true);
+//            profile.setCheckCount(0);
+//            profile.setFingerprintCreatedAt(Instant.now());
+//            profile.setFingerprintUpdatedAt(Instant.now());
+//            profile.updateFingerprintHash();
+//
+//            // 8. Сохраняем профиль
+//            Profile savedProfile = profileRepository.save(profile);
+//            log.info("Created profile with random mobile params: id={}, userAgent={}, screen={}x{}",
+//                    savedProfile.getId(), savedProfile.getUserAgent(),
+//                    savedProfile.getScreenWidth(), savedProfile.getScreenHeight());
+//
+//            return savedProfile;
+//
+//        } catch (Exception e) {
+//            log.error("Failed to create profile with random mobile params for key: {}", externalKey, e);
+//            throw new RuntimeException("Failed to create profile: " + e.getMessage(), e);
+//        }
+//    }
 
     /**
      * Создает профиль с рандомными мобильными параметрами
@@ -137,15 +229,14 @@ public class ProfilesService {
         Random random = new Random();
 
         // 1) language / locale
-        String[] mobileLanguages = {"en-US", "ru-RU", "zh-CN", "es-ES", "fr-FR", "de-DE"};
+        String[] mobileLanguages = {"en-US", "ru-RU"};
         String language = mobileLanguages[random.nextInt(mobileLanguages.length)];
         profile.setLanguage(language);
         profile.setLocale(language.replace("-", "_"));
 
         // 2) timezone (и offset строго из timezone!)
         String[] mobileTimezones = {
-                "Europe/Moscow", "America/New_York", "Europe/London",
-                "Asia/Tokyo", "Australia/Sydney", "Asia/Shanghai"
+                "Europe/Moscow", "Asia/Tokyo"
         };
         String tz = mobileTimezones[random.nextInt(mobileTimezones.length)];
         profile.setTimezone(tz);
@@ -191,86 +282,7 @@ public class ProfilesService {
 
 
 
-    private Profile createProfileWithRandomMobileParams(String externalKey, String proxyUrl,
-                                                        String deviceType, String detectionLevel) {
-        log.info("Creating profile with random mobile params: key={}, deviceType={}, level={}",
-                externalKey, deviceType, detectionLevel);
 
-        try {
-            // 1. Генерируем DeviceProfile с помощью fingerprintGenerator
-            DeviceProfile deviceProfile;
-            if ("random".equalsIgnoreCase(deviceType)) {
-                deviceProfile = fingerprintGenerator.generateRandomMobileProfile();
-                log.info("Generated random mobile profile");
-            } else {
-                deviceProfile = fingerprintGenerator.generateDeviceProfile(deviceType, detectionLevel);
-                log.info("Generated device profile for type: {}", deviceType);
-            }
-
-            if (deviceProfile == null) {
-                log.error("Failed to generate device profile for type: {}", deviceType);
-                throw new RuntimeException("Failed to generate device profile");
-            }
-
-            // 2. Создаем новый профиль и заполняем его данными
-            Profile profile = new Profile();
-            profile.setExternalKey(externalKey);
-            profile.setName(getDeviceDisplayName(deviceType) + " - " + externalKey);
-            profile.setDetectionLevel(detectionLevel);
-            profile.setDetectionRisk(calculateRiskForDetectionLevel(detectionLevel));
-
-            // 3. Заполняем базовые поля из DeviceProfile
-            profile.setUserAgent(deviceProfile.getUserAgent());
-            profile.setScreenWidth(deviceProfile.getWidth());
-            profile.setScreenHeight(deviceProfile.getHeight());
-            profile.setPixelRatio(deviceProfile.getPixelRatio());
-            profile.setPlatform(deviceProfile.getPlatform());
-            profile.setHardwareConcurrency(deviceProfile.getHardwareConcurrency());
-            profile.setDeviceMemory(deviceProfile.getDeviceMemory());
-            profile.setMaxTouchPoints(deviceProfile.getMaxTouchPoints());
-            profile.setWebglVendor(deviceProfile.getWebglVendor());
-            profile.setWebglRenderer(deviceProfile.getWebglRenderer());
-            profile.setWebglVersion(deviceProfile.getWebglVersion());
-            profile.setAudioContextLatency(deviceProfile.getAudioContextLatency());
-            profile.setCanvasFingerprint(deviceProfile.getCanvasFingerprint());
-            profile.setCanvasNoiseHash(deviceProfile.getCanvasNoiseHash());
-
-            // 4. Устанавливаем DeviceProfile JSON
-            try {
-                profile.setDeviceProfileJson(objectMapper.writeValueAsString(deviceProfile));
-            } catch (Exception e) {
-                log.warn("Failed to serialize device profile to JSON", e);
-            }
-
-            // 5. Устанавливаем рандомные мобильные параметры
-            setRandomMobileParameters(profile, deviceProfile.isMobile());
-
-            // 6. Создаем директорию профиля
-            String userDataPath = createProfileDirectory(externalKey);
-            profile.setUserDataPath(userDataPath);
-
-            // 7. Устанавливаем остальные поля
-            profile.setProxyUrl(proxyUrl);
-            profile.setStatus("FREE");
-            profile.setIsActive(true);
-            profile.setCheckCount(0);
-            profile.setFingerprintCreatedAt(Instant.now());
-            profile.setFingerprintUpdatedAt(Instant.now());
-            profile.updateFingerprintHash();
-
-            // 8. Сохраняем профиль
-            Profile savedProfile = profileRepository.save(profile);
-            log.info("Created profile with random mobile params: id={}, userAgent={}, screen={}x{}",
-                    savedProfile.getId(), savedProfile.getUserAgent(),
-                    savedProfile.getScreenWidth(), savedProfile.getScreenHeight());
-
-            return savedProfile;
-
-        } catch (Exception e) {
-            log.error("Failed to create profile with random mobile params for key: {}", externalKey, e);
-            throw new RuntimeException("Failed to create profile: " + e.getMessage(), e);
-        }
-    }
 
     /**
      * Обновляет fingerprint существующего профиля
@@ -285,10 +297,11 @@ public class ProfilesService {
                     // Сохраняем старый userDataPath чтобы не потерять сессии
                     String oldUserDataPath = profile.getUserDataPath();
                     String externalKey = profile.getExternalKey();
+                    String proxyUrl = profile.getProxyUrl();
 
                     // Генерируем новый профиль
                     Profile newProfileData = fingerprintGenerator.generateCompleteProfile(
-                            externalKey, deviceType, detectionLevel
+                            externalKey, deviceType, detectionLevel, proxyUrl
                     );
 
                     // Копируем fingerprint данные в существующий профиль
@@ -428,17 +441,21 @@ public class ProfilesService {
         log.info("Updating fingerprint with random mobile for profile: {}", existingProfile.getId());
 
         try {
-            // Генерируем новый случайный мобильный профиль
-            DeviceProfile newDeviceProfile = fingerprintGenerator.generateRandomMobileProfile();
+
 
             // Сохраняем старый userDataPath чтобы не потерять сессии
             String oldUserDataPath = existingProfile.getUserDataPath();
             String externalKey = existingProfile.getExternalKey();
+            String detectionLevel = "ENHANCED";
+
+
+            // Генерируем новый случайный мобильный профиль
+            Profile newDeviceProfile = fingerprintGenerator.generateCompleteProfile(externalKey, null, detectionLevel, null);
 
             // Обновляем базовые поля
             existingProfile.setUserAgent(newDeviceProfile.getUserAgent());
-            existingProfile.setScreenWidth(newDeviceProfile.getWidth());
-            existingProfile.setScreenHeight(newDeviceProfile.getHeight());
+            existingProfile.setScreenWidth(newDeviceProfile.getScreenWidth());
+            existingProfile.setScreenHeight(newDeviceProfile.getScreenHeight());
             existingProfile.setPixelRatio(newDeviceProfile.getPixelRatio());
             existingProfile.setPlatform(newDeviceProfile.getPlatform());
             existingProfile.setHardwareConcurrency(newDeviceProfile.getHardwareConcurrency());
@@ -459,7 +476,7 @@ public class ProfilesService {
             }
 
             // Обновляем мобильные параметры
-            setRandomMobileParameters(existingProfile, newDeviceProfile.isMobile());
+            setRandomMobileParameters(existingProfile, newDeviceProfile.isMobileDevice());
 
             // Восстанавливаем важные поля
             existingProfile.setUserDataPath(oldUserDataPath);
@@ -690,20 +707,7 @@ public class ProfilesService {
         log.debug("Created profile subdirectories in: {}", profilePath);
     }
 
-    /**
-     * Получает случайный тип мобильного устройства
-     */
-    private String getRandomMobileDeviceType() {
-        Random random = new Random();
-        return MOBILE_DEVICE_TYPES.get(random.nextInt(MOBILE_DEVICE_TYPES.size()));
-    }
 
-    /**
-     * Получает отображаемое имя устройства
-     */
-    private String getDeviceDisplayName(String deviceType) {
-        return DEVICE_DISPLAY_NAMES.getOrDefault(deviceType, deviceType);
-    }
 
     /**
      * Проверяет, является ли устройство iOS по User Agent

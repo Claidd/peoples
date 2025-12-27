@@ -43,8 +43,8 @@ public class FingerprintController {
     private final ProfilesService profilesService;
     private final ProfileRepository profileRepository;
     private final FingerprintCheckRepository checkRepository;
-    private final FingerprintGenerator fingerprintGenerator;
     private final BrowserScriptInjector scriptInjector;
+
 
     @PostMapping("/{profileId}/test")
     @Operation(summary = "Протестировать fingerprint профиля")
@@ -380,26 +380,37 @@ public class FingerprintController {
     }
 
     @GetMapping("/{profileId}/injection-script")
-    @Operation(summary = "Получить инъекционный скрипт для профиля")
     public ResponseEntity<InjectionScriptResponse> getInjectionScript(@PathVariable Long profileId) {
-
         return profileRepository.findById(profileId)
-                .map(profile -> {
-                    String script = scriptInjector.generateInjectionScript(profile);
-
-                    InjectionScriptResponse response = InjectionScriptResponse.builder()
+                .map(p -> {
+                    String script = (p.getInjectionScript() == null) ? "" : p.getInjectionScript();
+                    return ResponseEntity.ok(InjectionScriptResponse.builder()
                             .profileId(profileId)
-                            .externalKey(profile.getExternalKey())
-                            .detectionLevel(profile.getDetectionLevel())
+                            .externalKey(p.getExternalKey())
+                            .detectionLevel(p.getDetectionLevel())
                             .script(script)
                             .scriptLength(script.length())
-                            .generatedAt(Instant.now())
-                            .build();
-
-                    return ResponseEntity.ok(response);
+                            .generatedAt(p.getInjectionScriptUpdatedAt())
+                            .build());
                 })
                 .orElse(ResponseEntity.notFound().build());
     }
+
+
+//    @PostMapping("/{profileId}/apply-injection")
+//    @Operation(summary = "Сгенерить, применить в живом браузере и сохранить injection script в Profile")
+//    public ResponseEntity<?> applyInjection(@PathVariable Long profileId,
+//                                            @RequestParam(defaultValue = "true") boolean reload) {
+//        try {
+//            var res = injectionScriptService.generateApplyAndSave(profileId, reload);
+//            return ResponseEntity.ok(res);
+//        } catch (Exception e) {
+//            log.error("applyInjection failed for profileId={}", profileId, e);
+//            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+//                    .body(Map.of("profileId", profileId, "error", e.getMessage()));
+//        }
+//    }
+
 
     @PostMapping("/batch-test")
     @Operation(summary = "Массовое тестирование профилей")

@@ -180,6 +180,12 @@ find "${USER_DATA_DIR}" -maxdepth 2 -name "Singleton*" -delete 2>/dev/null || tr
 log "Profile dir: ${USER_DATA_DIR}"
 ls -la "${USER_DATA_DIR}" 2>/dev/null || true
 
+
+# Перед запуском Xvfb
+mkdir -p /run/dbus
+dbus-daemon --system --fork 2>/dev/null || true
+dbus-daemon --session --fork --address=unix:path=/tmp/dbus-session.log 2>/dev/null || true
+
 # =============================
 # Xvfb
 # =============================
@@ -223,6 +229,9 @@ NOVNC_PROXY="/usr/share/novnc/utils/novnc_proxy"
 log "Starting noVNC on :${NOVNC_PORT} ..."
 "${NOVNC_PROXY}" --listen "0.0.0.0:${NOVNC_PORT}" --vnc "127.0.0.1:5900" >/tmp/novnc.log 2>&1 &
 
+
+
+
 # =============================
 # Chromium
 # =============================
@@ -239,25 +248,35 @@ CHROME_ARGS=(
   "--no-first-run"
   "--no-default-browser-check"
   "--disable-dev-shm-usage"
-  "--disable-session-crashed-bubble"
-
-  # Важно: Chromium слушает только внутри (loopback) — наружу отдаём через socat
   "--remote-debugging-address=127.0.0.1"
   "--remote-debugging-port=${DEVTOOLS_PORT_INTERNAL}"
   "--remote-allow-origins=*"
-
+  # Эти два флага должны быть ТОЛЬКО ЗДЕСЬ и в одном экземпляре
+#  "--disable-blink-features=AutomationControlled"
+#  "--excludeSwitches=enable-automation"
+  "--disable-infobars"
   "--password-store=basic"
   "--use-mock-keychain"
-  "--no-sandbox"
 )
 
-log "Starting Chromium (new process group via setsid): ${CHROMIUM_BIN}"
+# Добавляем EXTRA_CHROME_ARGS из Java (разбиваем строку на элементы массива)
+if [[ -n "${EXTRA_CHROME_ARGS:-}" ]]; then
+  log "Adding extra args safely using xargs"
+  # xargs преобразует строку в массив, учитывая кавычки
+  while IFS= read -r -d '' arg; do
+    CHROME_ARGS+=("$arg")
+  done < <(echo -n "${EXTRA_CHROME_ARGS}" | xargs printf '%s\0')
+fi
+
+log "Starting Chromium (new process group): ${CHROMIUM_BIN}"
+# Запуск с массивом аргументов [@], чтобы кавычки внутри аргументов сохранялись
 setsid "${CHROMIUM_BIN}" "${CHROME_ARGS[@]}" >"${CHROME_LOG}" 2>&1 &
-CHROME_PID=$!
+CHROME_PID=$! # Сначала сохраняем PID последнего фонового процесса
 sleep 0.5
 CHROME_PGID="$(get_pgid "${CHROME_PID}")"
 
 log "Chromium PID: ${CHROME_PID}, PGID: ${CHROME_PGID}"
+
 
 sleep 2
 if ! kill -0 "${CHROME_PID}" 2>/dev/null; then
@@ -343,7 +362,37 @@ exit 0
 
 
 
-
+# =============================
+# Chromium
+# =============================
+#CHROME_LOG="/tmp/chromium.log"
+#rm -f "${CHROME_LOG}" 2>/dev/null || true
+#
+#CHROME_ARGS=(
+#  "--user-data-dir=${USER_DATA_DIR}"
+#  "--profile-directory=Default"
+#  "--window-size=${SCREEN_WIDTH},${SCREEN_HEIGHT}"
+#  "--window-position=0,0"
+#  "--lang=${LANGUAGE_SAFE}"
+#  "--restore-last-session"
+#  "--no-first-run"
+#  "--no-default-browser-check"
+#  "--disable-dev-shm-usage"
+#  "--disable-session-crashed-bubble"
+#
+#  # Важно: Chromium слушает только внутри (loopback) — наружу отдаём через socat
+#  "--remote-debugging-address=127.0.0.1"
+#  "--remote-debugging-port=${DEVTOOLS_PORT_INTERNAL}"
+#  "--remote-allow-origins=*"
+#
+#  "--password-store=basic"
+#  "--use-mock-keychain"
+#  "--no-sandbox"
+#)
+#
+#log "Starting Chromium (new process group via setsid): ${CHROMIUM_BIN}"
+#setsid "${CHROMIUM_BIN}" "${CHROME_ARGS[@]}" >"${CHROME_LOG}" 2>&1 &
+#CHROME_PID=$!
 
 
 #!/usr/bin/env bash

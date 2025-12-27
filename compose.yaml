@@ -23,7 +23,10 @@ services:
         context: ./browser-image
         dockerfile: Dockerfile
       container_name: multi-browser-chrome-vnc
-
+      cap_add:
+        - SYS_ADMIN
+      security_opt:
+        - seccomp:unconfined
       user: "0:0"
 
       environment:

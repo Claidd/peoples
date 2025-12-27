@@ -11,6 +11,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
@@ -28,29 +29,38 @@ public class DevToolsCdpClient {
         return new SessionImpl(wsUrl, connectTimeoutMs, connectionLostTimeoutSec);
     }
 
-    private final class SessionImpl implements DevToolsSession, AutoCloseable {
+    private final class SessionImpl implements DevToolsSession {
 
         private final String wsUrl;
+
         private final ConcurrentHashMap<Integer, CompletableFuture<JsonNode>> pending = new ConcurrentHashMap<>();
         private final AtomicInteger idGen = new AtomicInteger(1);
 
-        private final CompletableFuture<Void> opened = new CompletableFuture<>();
-        private volatile Consumer<JsonNode> eventHandler;
+        // handlers by method
+        private final ConcurrentHashMap<String, CopyOnWriteArrayList<Consumer<JsonNode>>> handlers = new ConcurrentHashMap<>();
 
         private volatile WebSocketClient ws;
 
+        // ✅ created in ctor (fixes NPE)
+        private final ExecutorService eventExec;
+
+        // optional: avoid leaking if someone forgets close()
+        private final AtomicBoolean closed = new AtomicBoolean(false);
+
         private SessionImpl(String wsUrl, long connectTimeoutMs, int connectionLostTimeoutSec) {
             this.wsUrl = Objects.requireNonNull(wsUrl, "wsUrl");
+
+            this.eventExec = Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "cdp-events-" + Math.abs(this.wsUrl.hashCode()));
+                t.setDaemon(true);
+                return t;
+            });
+
             try {
-                // ✅ connect с retry и новым ws на каждую попытку
-                this.ws = connectWithRetry(wsUrl, connectTimeoutMs, connectionLostTimeoutSec);
-
-                // дождёмся onOpen (с запасом)
-                long waitMs = Math.max(1000, connectTimeoutMs);
-                opened.get(waitMs, TimeUnit.MILLISECONDS);
-
+                this.ws = connectWithRetry(this.wsUrl, connectTimeoutMs, connectionLostTimeoutSec);
             } catch (Exception e) {
                 safeCloseWs();
+                safeShutdownExec();
                 throw new RuntimeException("Failed to open CDP session: " + e.getMessage(), e);
             }
         }
@@ -67,18 +77,18 @@ public class DevToolsCdpClient {
                     boolean ok = client.connectBlocking(connectTimeoutMs, TimeUnit.MILLISECONDS);
                     if (!ok) throw new TimeoutException("CDP connectBlocking timeout: " + wsUrl);
 
+                    if (!client.isOpen()) throw new RuntimeException("CDP connected but ws not open: " + wsUrl);
+
+                    log.debug("CDP WS connected (attempt {}): {}", attempt, wsUrl);
                     return client;
 
                 } catch (Exception e) {
                     last = e;
                     log.debug("CDP connect attempt {} failed: {}", attempt, e.getMessage());
 
-                    // закрываем текущий client (если успел создать)
                     if (client != null) {
                         try { client.close(); } catch (Exception ignore) {}
                     }
-
-                    // перед повтором чуть подождём
                     if (attempt == 1) {
                         try { Thread.sleep(250); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
                     }
@@ -93,7 +103,6 @@ public class DevToolsCdpClient {
 
                 @Override
                 public void onOpen(ServerHandshake handshake) {
-                    opened.complete(null);
                     log.debug("CDP WS opened: {}", wsUrl);
                 }
 
@@ -102,7 +111,7 @@ public class DevToolsCdpClient {
                     try {
                         JsonNode node = objectMapper.readTree(message);
 
-                        // Ответ на команду: {"id":..., "result":...} или {"id":..., "error":...}
+                        // response to command
                         if (node.has("id")) {
                             int id = node.get("id").asInt();
                             CompletableFuture<JsonNode> fut = pending.remove(id);
@@ -110,14 +119,22 @@ public class DevToolsCdpClient {
                             return;
                         }
 
-                        // Событие CDP: {"method":"...","params":{...}}
-                        Consumer<JsonNode> h = eventHandler;
-                        if (h != null) {
-                            try { h.accept(node); }
-                            catch (Exception handlerEx) {
-                                log.debug("CDP event handler error: {}", handlerEx.getMessage());
+                        // event: {"method":"...","params":...}
+                        String method = node.path("method").asText(null);
+                        if (method == null) return;
+
+                        var list = handlers.get(method);
+                        if (list == null || list.isEmpty()) return;
+
+                        // do not block WS thread
+                        eventExec.execute(() -> {
+                            for (Consumer<JsonNode> h : list) {
+                                try { h.accept(node); }
+                                catch (Exception ex) {
+                                    log.debug("CDP handler error ({}): {}", method, ex.getMessage());
+                                }
                             }
-                        }
+                        });
 
                     } catch (Exception e) {
                         log.debug("CDP parse error: {}", e.getMessage());
@@ -126,19 +143,24 @@ public class DevToolsCdpClient {
 
                 @Override
                 public void onClose(int code, String reason, boolean remote) {
-                    RuntimeException ex = new RuntimeException("CDP WS closed: " + code + " " + reason);
-                    if (!opened.isDone()) opened.completeExceptionally(ex);
-                    failAllPending(ex);
+                    shutdownFromRemote(new RuntimeException("CDP WS closed: " + code + " " + reason));
                     log.debug("CDP WS closed: {} {}", code, reason);
                 }
 
                 @Override
                 public void onError(Exception ex) {
-                    if (!opened.isDone()) opened.completeExceptionally(ex);
-                    failAllPending(ex);
+                    shutdownFromRemote(ex);
                     log.debug("CDP WS error: {}", ex.getMessage());
                 }
             };
+        }
+
+        private void shutdownFromRemote(Exception ex) {
+            if (!closed.compareAndSet(false, true)) return;
+            failAllPending(ex);
+            safeCloseWs();
+            safeShutdownExec();
+            handlers.clear();
         }
 
         @Override
@@ -147,12 +169,26 @@ public class DevToolsCdpClient {
         }
 
         @Override
-        public void setEventHandler(Consumer<JsonNode> handler) {
-            this.eventHandler = handler;
+        public AutoCloseable onEvent(String method, Consumer<JsonNode> handler) {
+            Objects.requireNonNull(method, "method");
+            Objects.requireNonNull(handler, "handler");
+
+            handlers.computeIfAbsent(method, k -> new CopyOnWriteArrayList<>()).add(handler);
+
+            // unsubscribe
+            return () -> {
+                var list = handlers.get(method);
+                if (list != null) {
+                    list.remove(handler);
+                    if (list.isEmpty()) handlers.remove(method);
+                }
+            };
         }
 
         @Override
         public JsonNode send(String method, Map<String, Object> params, long timeoutMs) {
+            if (closed.get()) throw new RuntimeException("CDP session already closed");
+
             int id = idGen.getAndIncrement();
             CompletableFuture<JsonNode> fut = new CompletableFuture<>();
             pending.put(id, fut);
@@ -193,9 +229,13 @@ public class DevToolsCdpClient {
 
         @Override
         public void close() {
+            if (!closed.compareAndSet(false, true)) return;
+
             RuntimeException ex = new RuntimeException("CDP session closed by client");
             failAllPending(ex);
             safeCloseWs();
+            safeShutdownExec();
+            handlers.clear();
         }
 
         private void failAllPending(Exception ex) {
@@ -215,6 +255,14 @@ public class DevToolsCdpClient {
                 }
             } catch (Exception ignore) {}
         }
+
+        private void safeShutdownExec() {
+            try { eventExec.shutdownNow(); } catch (Exception ignore) {}
+        }
+
+
     }
+
 }
+
 

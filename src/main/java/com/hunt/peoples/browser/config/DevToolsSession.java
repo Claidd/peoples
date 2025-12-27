@@ -7,6 +7,7 @@ import java.io.Closeable;
 import java.util.Map;
 import java.util.function.Consumer;
 
+
 public interface DevToolsSession extends Closeable {
 
     /**
@@ -14,20 +15,16 @@ public interface DevToolsSession extends Closeable {
      */
     JsonNode send(String method, Map<String, Object> params, long timeoutMs);
 
-    /**
-     * WS url сессии (для логов / отладки).
-     */
-    String getWsUrl();
-
-    /**
-     * Подписка на CDP events (сообщения без поля "id": {"method":"...","params":...}).
-     * Можно поставить null, чтобы отключить.
-     */
-    void setEventHandler(Consumer<JsonNode> handler);
-
     default JsonNode send(String method, long timeoutMs) {
         return send(method, Map.of(), timeoutMs);
     }
+
+    String getWsUrl();
+
+    /**
+     * ✅ подписка на конкретное событие + возможность отписаться
+     */
+    AutoCloseable onEvent(String method, Consumer<JsonNode> handler);
 
     default JsonNode evaluate(String expression, long timeoutMs) {
         return send("Runtime.evaluate", Map.of(
@@ -50,13 +47,14 @@ public interface DevToolsSession extends Closeable {
     }
 
     default void safeSend(String method, long timeoutMs) {
-        try {
-            send(method, timeoutMs);
-        } catch (Exception ignore) {
-            // логируй debug, но не падай
-        }
+        try { send(method, timeoutMs); } catch (Exception ignore) {}
     }
 
     @Override
     void close();
+
+    default void safeSend(String method, Map<String, Object> params, long timeoutMs) {
+        try { send(method, params, timeoutMs); } catch (Exception ignore) {}
+    }
 }
+

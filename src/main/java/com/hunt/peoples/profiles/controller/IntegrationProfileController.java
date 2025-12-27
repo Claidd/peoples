@@ -41,6 +41,7 @@ public class IntegrationProfileController {
             @Valid @RequestBody IntegrationConnectRequest request) {
 
         String externalKey = request.externalKey();
+        System.out.println("!!!externalKey!!!: " + externalKey);
         String proxyUrl = request.proxyUrl();
         String deviceType = request.deviceType();
         String detectionLevel = request.detectionLevel();

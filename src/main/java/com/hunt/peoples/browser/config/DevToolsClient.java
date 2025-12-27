@@ -37,7 +37,6 @@ public class DevToolsClient {
      * @param connectionLostTimeoutSec ping/pong watchdog (java-websocket)
      */
     public DevToolsSession connect(String wsUrl, int connectTimeoutMs, int connectionLostTimeoutSec) {
-
         return cdpClient.openSession(wsUrl, connectTimeoutMs, connectionLostTimeoutSec);
     }
 }

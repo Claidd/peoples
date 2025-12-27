@@ -1,7 +1,5 @@
 package com.hunt.peoples.profiles.entity;
 
-import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.*;
@@ -63,6 +61,7 @@ public class Profile implements Serializable {
     @Column(name = "locked_by_user_id")
     private String lockedByUserId;
 
+
     // === БАЗОВЫЙ FINGERPRINT ===
 
     // 1. Device basics
@@ -110,6 +109,10 @@ public class Profile implements Serializable {
 
     @Column(name = "canvas_noise_hash")
     private String canvasNoiseHash;
+
+    // Поддержка HDR, палитры и т.д.
+    @Column(name = "screen_color_gamut")
+    private String screenColorGamut; // "srgb", "p3", "rec2020"
 
     // === РАСШИРЕННЫЙ ANTIDETECT FINGERPRINT ===
 
@@ -177,6 +180,7 @@ public class Profile implements Serializable {
     @Column(columnDefinition = "TEXT", name = "plugins_json")
     private String pluginsJson;
 
+
     // 12. Locale & Timezone
     @Column(name = "timezone")
     private String timezone;
@@ -230,6 +234,11 @@ public class Profile implements Serializable {
     @Column(columnDefinition = "TEXT", name = "common_websites_json")
     private String commonWebsitesJson;
 
+
+    // === ДОБАВЬТЕ ЭТО ПОЛЕ СЮДА ===
+    @Column(name = "cookies_json", columnDefinition = "TEXT")
+    private String cookiesJson;
+
     // === ВЕРСИИ И МЕТАДАННЫЕ ===
 
     @Column(name = "chrome_version")
@@ -281,6 +290,93 @@ public class Profile implements Serializable {
     @LastModifiedDate
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
+
+    @Column(name = "notification_permission")
+    private String notificationPermission; // default|denied|granted
+
+    @Column(name = "injection_script", columnDefinition = "TEXT")
+    private String injectionScript;
+
+    @Column(name = "injection_script_updated_at")
+    private Instant injectionScriptUpdatedAt;
+
+    @Column(name = "injection_script_hash", length = 64)
+    private String injectionScriptHash;
+
+
+
+    // === CLIENT HINTS (UA-CH) ===
+
+    // Пример: "Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"
+    @Column(columnDefinition = "TEXT", name = "ua_ch_brands_json")
+    private String uaChBrandsJson;
+
+    // Windows, Linux, Android, iOS
+    @Column(name = "ua_ch_platform")
+    private String uaChPlatform;
+
+    // Версия платформы (напр. "10.0.0")
+    @Column(name = "ua_ch_platform_version")
+    private String uaChPlatformVersion;
+
+    // Архитектура: "x86", "arm"
+    @Column(name = "ua_ch_architecture")
+    private String uaChArchitecture;
+
+    // Модель устройства (напр. "Pixel 6")
+    @Column(name = "ua_ch_model")
+    private String uaChModel;
+
+    // Битность: "64" или "32"
+    @Column(name = "ua_ch_bitness")
+    private String uaChBitness;
+
+    // Является ли мобильным устройством
+    @Column(name = "ua_ch_mobile")
+    private Boolean uaChMobile;
+
+
+
+    // === WEBRTC & NETWORK ===
+
+    // REAL, DISABLED, FAKE_LOCAL, FAKE_PUBLIC
+    @Column(name = "webrtc_mode")
+    private String webrtcMode;
+
+    // IP, который мы показываем как локальный (напр. 192.168.1.55)
+    @Column(name = "webrtc_local_ip")
+    private String webrtcLocalIp;
+
+    // IP, который показываем как публичный (должен совпадать с Proxy IP!)
+    @Column(name = "webrtc_public_ip")
+    private String webrtcPublicIp;
+
+    // Кастомные DNS, чтобы избежать DNS Leaks через провайдера
+    @Column(columnDefinition = "TEXT", name = "dns_servers_json")
+    private String dnsServersJson;
+
+
+    // === GEOLOCATION ===
+
+    // Режим: ALLOW, BLOCK, PROMPT
+    @Column(name = "geo_permission")
+    private String geoPermission;
+
+    @Column(name = "geo_latitude")
+    private Double geoLatitude;
+
+    @Column(name = "geo_longitude")
+    private Double geoLongitude;
+
+    // Точность в метрах (рандомизировать, напр. 10-50м)
+    @Column(name = "geo_accuracy")
+    private Double geoAccuracy;
+
+
+
+    // Список голосов (Google US English, Microsoft David, etc.)
+    @Column(columnDefinition = "TEXT", name = "speech_voices_json")
+    private String speechVoicesJson;
 
     // === ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ===
 
@@ -542,18 +638,18 @@ public class Profile implements Serializable {
      * Получает список сайтов
      */
     @Transient
+    // Добавьте это в класс Profile.java
     public List<String> getCommonWebsites() {
-        try {
-            if (commonWebsitesJson != null && !commonWebsitesJson.isEmpty() && !commonWebsitesJson.equals("null")) {
-                return new ObjectMapper().readValue(
-                        commonWebsitesJson,
-                        new TypeReference<List<String>>() {}
-                );
-            }
-        } catch (Exception e) {
-            log.error("Failed to parse commonWebsitesJson for profile {}", id, e);
+        if (this.commonWebsitesJson == null || this.commonWebsitesJson.isBlank()) {
+            return List.of();
         }
-        return new ArrayList<>();
+        try {
+            // Если это JSON массив ["site1", "site2"]
+            return new ObjectMapper().readValue(this.commonWebsitesJson, new TypeReference<List<String>>() {});
+        } catch (Exception e) {
+            // Если там просто строка через запятую
+            return Arrays.asList(this.commonWebsitesJson.split("\\s*,\\s*"));
+        }
     }
 
     /**
@@ -564,7 +660,6 @@ public class Profile implements Serializable {
         try {
             this.commonWebsitesJson = new ObjectMapper().writeValueAsString(websites);
         } catch (Exception e) {
-            log.error("Failed to serialize commonWebsites for profile {}", id, e);
             this.commonWebsitesJson = "[]";
         }
     }
@@ -931,7 +1026,7 @@ public class Profile implements Serializable {
                 .name(name + " - " + randomDevice)
                 .userAgent(isIos ?
                         "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1" :
-                        "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36")
+                        "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36")
                 .screenWidth(isIos ? 393 : 412)
                 .screenHeight(isIos ? 852 : 915)
                 .pixelRatio(isIos ? 3.0 : 2.63)
@@ -970,6 +1065,8 @@ public class Profile implements Serializable {
                 .status("FREE")
                 .build();
     }
+
+
 }
 
 //public static Profile createBasicProfile(String externalKey, String name) {
